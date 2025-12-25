@@ -29,12 +29,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_sleep.h"
+#include "esp_timer.h"
 #include "led_strip.h"
 #include "sdkconfig.h"
 #include "nvs_flash.h"
@@ -42,6 +44,7 @@
 #include "mqtt_client.h"
 #include "esp_adc/adc_oneshot.h"
 #include "driver/ledc.h"  /* PWM for passive buzzer */
+#include "esp_random.h"   /* For esp_random() in song selection */
 #include "credentials.h"  /* WiFi and Adafruit IO credentials (gitignored) */
 
 /* Logging tags for different components */
@@ -399,6 +402,26 @@ static float read_potentiometer(void)
     return pot_brightness;
 }
 
+/* Track pot changes for brightness gauge display */
+static float pot_prev_value = 0.5f;
+static int pot_idle_frames = 999;  /* Frames since last pot change (start high to skip gauge on boot) */
+static const int POT_GAUGE_TIMEOUT = 90;  /* Show gauge for ~1.5 seconds after last change (60fps) */
+
+/* Check if pot is being adjusted (returns true if gauge should show) */
+static bool is_pot_adjusting(void)
+{
+    float diff = fabsf(pot_brightness - pot_prev_value);
+    
+    if (diff > 0.01f) {  /* Pot moved more than 1% */
+        pot_idle_frames = 0;
+        pot_prev_value = pot_brightness;
+    } else {
+        pot_idle_frames++;
+    }
+    
+    return (pot_idle_frames < POT_GAUGE_TIMEOUT);
+}
+
 /* ============================================================================
    BUZZER FUNCTIONS
    ============================================================================ */
@@ -521,6 +544,252 @@ static void buzzer_error(void)
 static void buzzer_click(void)
 {
     buzzer_play_melody(MELODY_BUTTON_PRESS, MELODY_BUTTON_PRESS_LEN);
+}
+
+/* ============================================================================
+   RTTTL (Ring Tone Text Transfer Language) PARSER
+   ============================================================================
+   Nokia ringtone format: name:d=duration,o=octave,b=bpm:notes
+   Example: "TakeonMe:d=4,o=4,b=160:8f#5,8f#5,8f#5,8d5,8p..."
+   ============================================================================ */
+
+/* RTTTL note frequencies lookup table (octave 4 base) */
+static const uint16_t rtttl_notes[] = {
+    /* c, c#, d, d#, e, f, f#, g, g#, a, a#, b */
+    262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494
+};
+
+/* Parse a single RTTTL note character to index (0-11, or -1 for pause) */
+static int rtttl_note_to_index(char note) {
+    switch (note) {
+        case 'c': return 0;
+        case 'd': return 2;
+        case 'e': return 4;
+        case 'f': return 5;
+        case 'g': return 7;
+        case 'a': return 9;
+        case 'b': return 11;
+        case 'p': return -1;  /* Pause/rest */
+        default: return -2;   /* Invalid */
+    }
+}
+
+/* Play RTTTL ringtone string directly (blocking) */
+static void buzzer_play_rtttl(const char *rtttl)
+{
+    if (!buzzer_initialized || rtttl == NULL) return;
+    
+    const char *p = rtttl;
+    
+    /* Skip name (everything before first ':') */
+    while (*p && *p != ':') p++;
+    if (*p != ':') return;
+    p++;
+    
+    /* Parse defaults section (d=duration, o=octave, b=bpm) */
+    int default_duration = 4;
+    int default_octave = 6;
+    int bpm = 63;
+    
+    while (*p && *p != ':') {
+        if (*p == 'd' && *(p+1) == '=') {
+            p += 2;
+            default_duration = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+        } else if (*p == 'o' && *(p+1) == '=') {
+            p += 2;
+            default_octave = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+        } else if (*p == 'b' && *(p+1) == '=') {
+            p += 2;
+            bpm = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+        } else {
+            p++;
+        }
+    }
+    if (*p != ':') return;
+    p++;
+    
+    /* Calculate whole note duration in ms: (60000 / bpm) * 4 */
+    int whole_note_ms = (60000 / bpm) * 4;
+    
+    /* Parse and play notes */
+    while (*p) {
+        /* Skip whitespace and commas */
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        
+        /* Parse duration (optional, before note) */
+        int duration = default_duration;
+        if (*p >= '0' && *p <= '9') {
+            duration = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        
+        /* Parse note letter */
+        char note_char = *p++;
+        if (note_char >= 'A' && note_char <= 'Z') {
+            note_char = note_char - 'A' + 'a';  /* Convert to lowercase */
+        }
+        int note_idx = rtttl_note_to_index(note_char);
+        if (note_idx == -2) continue;  /* Invalid note, skip */
+        
+        /* Check for sharp */
+        bool is_sharp = false;
+        if (*p == '#') {
+            is_sharp = true;
+            p++;
+        }
+        
+        /* Check for dotted note */
+        bool dotted = false;
+        if (*p == '.') {
+            dotted = true;
+            p++;
+        }
+        
+        /* Parse octave (optional, after note) */
+        int octave = default_octave;
+        if (*p >= '0' && *p <= '9') {
+            octave = *p - '0';
+            p++;
+        }
+        
+        /* Check for dotted note (can also appear after octave) */
+        if (*p == '.') {
+            dotted = true;
+            p++;
+        }
+        
+        /* Calculate note duration in ms */
+        int note_duration_ms = whole_note_ms / duration;
+        if (dotted) {
+            note_duration_ms = note_duration_ms + (note_duration_ms / 2);
+        }
+        
+        /* Calculate frequency */
+        uint16_t freq = 0;
+        if (note_idx >= 0) {
+            int idx = note_idx;
+            if (is_sharp) idx++;
+            if (idx > 11) idx = 11;
+            
+            /* Get base frequency (octave 4) and shift to target octave */
+            freq = rtttl_notes[idx];
+            int octave_shift = octave - 4;
+            if (octave_shift > 0) {
+                freq <<= octave_shift;  /* Multiply by 2^shift */
+            } else if (octave_shift < 0) {
+                freq >>= (-octave_shift);  /* Divide by 2^shift */
+            }
+        }
+        
+        /* Play the note */
+        if (freq > 0) {
+            buzzer_tone(freq, note_duration_ms);
+        } else {
+            vTaskDelay(note_duration_ms / portTICK_PERIOD_MS);
+        }
+    }
+    
+    buzzer_stop();
+}
+
+/* ============================================================================
+   RTTTL SONG LIBRARY (5-10 seconds each)
+   ============================================================================ */
+
+/* Array of all songs for random selection - using string literals directly */
+static const char * const SONG_LIBRARY[] = {
+    /* Littleroot Town (Pokemon Ruby/Sapphire/Emerald) - lowered one octave */
+    "Littleroot:d=4,o=4,b=100:8c4,8f4,8g4,4a4,8p,8g4,8a4,8g4,8a4,8a#4,8p,4c5,8d5,8a4,8g4,8a4,8c#5,4d5,4e5,4d5,8a4,8g4,8f4,8e4,8f4,8a4,4d5,8d4,8e4,2f4,8c5,8a#4,8a#4,8a4,2f4,8d5,8a4,8a4,8g4,2f4",
+    /* YMCA - Village People */
+    "YMCA:d=8,o=5,b=160:c#6,a#,2p,a#,g#,f#,g#,a#,4c#6,a#,4c#6,d#6,a#,2p,a#,g#,f#,g#,a#,4c#6,a#,4c#6,d#6,b,2p,b,a#,g#,a#,b,4d#6,f#6,4d#6,4f6.,4d#6.,4c#6.,4b.,4a#,4g#",
+    /* Zelda Song of Storms */
+    "zelda_storms:d=4,o=5,b=180:8d6,8f6,d7,p,8d6,8f6,d7,p,e7,8p,8f7,8e7,8f7,8e7,8c7,a6,8p,a6,d6,8f6,8g6,2a6,8p,a6,d6,8f6,8g6,2e6,8p,8d6,8f6,d7,p,8d6,8f6,d7,p,e7,8p,8f7,8e7,8f7,8e7,8c7,a6,8p,a6,d6,8f6,8g6,a6,8p,a6,1d6",
+    /* Rudolph the Red Nosed Reindeer */
+    "Rudolph:d=8,o=5,b=250:g,4a,g,4e,4c6,4a,2g.,g,a,g,a,4g,4c6,2b.,4p,f,4g,f,4d,4b,4a,2g.,g,a,g,a,4g,4a,2e.,4p,g,4a,a,4e,4c6,4a,2g.,g,a,g,a,4g,4c6,2b.,4p,f,4g,f,4d,4b,4a,2g.,g,a,g,a,4g,4d6,2c6.,4p,4a,4a,4c6,4a,4g,4e,2g,4d,4e,4g,4a,4b,4b,2b,4c6,4c6,4b,4a,4g,4f,2d,g,4a,g,4e,4c6,4a,2g.,g,a,g,a,4g,4c6,2b.,4p,f,4g,f,4d,4b,4a,2g.,4g,4a,4g,4a,2g,2d6,1c6."
+};
+#define SONG_LIBRARY_SIZE (sizeof(SONG_LIBRARY) / sizeof(SONG_LIBRARY[0]))
+
+/* ============================================================================
+   MELODY TASK (Non-blocking background playback)
+   ============================================================================
+   Uses a FreeRTOS task to play melodies in the background while the main
+   animation loop continues running. This is similar to JavaScript's event loop!
+   ============================================================================ */
+
+/* Flag to track if a melody is currently playing (blocks button input) */
+static volatile bool melody_playing = false;
+
+/* Queue handle for song requests */
+static QueueHandle_t melody_queue = NULL;
+
+/* Melody task - runs in background, plays songs from queue */
+static void melody_task(void *pvParameters)
+{
+    int song_index;
+    
+    ESP_LOGI(TAG_BUZZER, "Melody task started - ready for songs!");
+    
+    while (1) {
+        /* Wait for a song request (blocks until something is in the queue) */
+        if (xQueueReceive(melody_queue, &song_index, portMAX_DELAY) == pdTRUE) {
+            melody_playing = true;
+            
+            ESP_LOGI(TAG_BUZZER, "Playing song %d of %d", song_index + 1, (int)SONG_LIBRARY_SIZE);
+            
+            /* Play the RTTTL song (this blocks the melody task, but not the main loop!) */
+            buzzer_play_rtttl(SONG_LIBRARY[song_index]);
+            
+            melody_playing = false;
+        }
+    }
+}
+
+/* Initialize the melody task and queue */
+static void init_melody_task(void)
+{
+    /* Create queue for song requests (holds 1 song at a time - no queuing multiple) */
+    melody_queue = xQueueCreate(1, sizeof(int));
+    
+    if (melody_queue == NULL) {
+        ESP_LOGE(TAG_BUZZER, "Failed to create melody queue!");
+        return;
+    }
+    
+    /* Create the melody task with its own stack */
+    BaseType_t result = xTaskCreate(
+        melody_task,        /* Task function */
+        "melody_task",      /* Name */
+        4096,               /* Stack size (bytes) */
+        NULL,               /* Parameters */
+        5,                  /* Priority (lower than main loop) */
+        NULL                /* Task handle (not needed) */
+    );
+    
+    if (result != pdPASS) {
+        ESP_LOGE(TAG_BUZZER, "Failed to create melody task!");
+    } else {
+        ESP_LOGI(TAG_BUZZER, "Melody task created - background playback enabled!");
+    }
+}
+
+/* Request a random song to play (non-blocking - returns immediately) */
+static void buzzer_play_random_song(void)
+{
+    if (melody_playing || melody_queue == NULL) {
+        /* Already playing a song or queue not initialized, ignore */
+        return;
+    }
+    
+    /* Pick a random song */
+    uint32_t random_val = esp_random();
+    int song_index = random_val % SONG_LIBRARY_SIZE;
+    
+    /* Queue the song (non-blocking - if queue is full, just ignore) */
+    xQueueSend(melody_queue, &song_index, 0);
 }
 
 /* ============================================================================
@@ -846,11 +1115,12 @@ static led_strip_handle_t rgbw_strip = NULL;
 /* ============================================================================
    POWER BUTTON AND STANDBY MODE
    ============================================================================
-   A momentary switch connected between this GPIO and GND.
-   Press to toggle between standby and active mode.
+   BOOT Button (GPIO9): Built-in button on ESP32-C6 devkit - used for power on/off
+   Melody Button (GPIO5): External button - triggers random melody playback
    ============================================================================ */
 
-#define POWER_BUTTON_GPIO 5  /* Change this to your button's GPIO */
+#define BOOT_BUTTON_GPIO 9     /* Built-in BOOT button for power on/off */
+#define MELODY_BUTTON_GPIO 5   /* External button for melody playback */
 
 /* Forward declaration for onboard LED control (defined in LED section below) */
 static void set_onboard_led_rgb_internal(uint8_t r, uint8_t g, uint8_t b);
@@ -859,25 +1129,38 @@ static void set_onboard_led_rgb_internal(uint8_t r, uint8_t g, uint8_t b);
 /* Flag to track if shutdown was requested */
 static volatile bool shutdown_requested = false;
 
-/* Configure power button GPIO */
-static void configure_power_button(void)
+/* Configure both buttons */
+static void configure_buttons(void)
 {
-    ESP_LOGI(TAG, "Configuring power button on GPIO%d", POWER_BUTTON_GPIO);
+    ESP_LOGI(TAG, "Configuring BOOT button (power) on GPIO%d", BOOT_BUTTON_GPIO);
+    ESP_LOGI(TAG, "Configuring MELODY button on GPIO%d", MELODY_BUTTON_GPIO);
     
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << POWER_BUTTON_GPIO),
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO) | (1ULL << MELODY_BUTTON_GPIO),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,    /* Internal pull-up, button connects to GND */
+        .pull_up_en = GPIO_PULLUP_ENABLE,    /* Internal pull-up, buttons connect to GND */
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE       /* We'll poll in the main loop */
     };
     gpio_config(&io_conf);
 }
 
-/* Check if power button is pressed (active low with pull-up) */
+/* Legacy function name for compatibility */
+static void configure_power_button(void)
+{
+    configure_buttons();
+}
+
+/* Check if power button (BOOT) is pressed (active low with pull-up) */
 static bool is_power_button_pressed(void)
 {
-    return gpio_get_level(POWER_BUTTON_GPIO) == 0;
+    return gpio_get_level(BOOT_BUTTON_GPIO) == 0;
+}
+
+/* Check if melody button is pressed (active low with pull-up) */
+static bool is_melody_button_pressed(void)
+{
+    return gpio_get_level(MELODY_BUTTON_GPIO) == 0;
 }
 
 /* Standby mode: dim orange pulsing on ONBOARD LED only, waiting for button press
@@ -890,11 +1173,11 @@ static bool run_standby_mode(void)
     ESP_LOGI(TAG, "║     STANDBY MODE - Press button to start                 ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, ">>> NeoPixel GPIO is IDLE - safe to disconnect.");
-    ESP_LOGI(TAG, ">>> Onboard LED: static dim red (R=5)");
+    ESP_LOGI(TAG, ">>> Onboard LED: dim orange");
     ESP_LOGI(TAG, "");
     
-    /* Set onboard LED to constant dim red: R=5, G=0, B=0 */
-    set_onboard_led_rgb_internal(5, 0, 0);
+    /* Set onboard LED to dim orange: R=8, G=3, B=0 */
+    set_onboard_led_rgb_internal(8, 3, 0);
     
     while (1) {
         /* Check for button press */
@@ -1045,6 +1328,57 @@ static void refresh_strip(void)
         return;
     }
     led_strip_refresh(rgbw_strip);
+}
+
+/* Draw brightness gauge on LED strip
+   Shows current brightness as a bar graph with gradient */
+static void draw_brightness_gauge(void)
+{
+    if (rgbw_strip == NULL) return;
+    
+    float brightness_pct = pot_brightness;  /* 0.05 to 1.0 */
+    
+    /* Normalize to 0-1 range for gauge calculation */
+    float normalized = (brightness_pct - 0.05f) / 0.95f;
+    if (normalized < 0) normalized = 0;
+    if (normalized > 1) normalized = 1;
+    
+    /* Gauge fills like a gradient "pouring" into the strip:
+       - At minimum: ~4 pixels lit with gradient
+       - At maximum: all 45 pixels lit with gradient stretched across
+       - The gradient always goes from bright (first pixel) to dim (last lit pixel)
+    */
+    
+    const int MIN_FILL_PIXELS = 4;   /* Minimum pixels shown at lowest setting */
+    const float HEAD_BRIGHTNESS = 0.30f;  /* First pixel brightness (30%) */
+    const float TAIL_BRIGHTNESS = 0.02f;  /* Last lit pixel brightness (2% - barely visible) */
+    
+    /* Calculate how many pixels should be filled */
+    /* Lerp from MIN_FILL_PIXELS to RGBW_LED_COUNT based on normalized */
+    float fill_pixels_float = MIN_FILL_PIXELS + normalized * (RGBW_LED_COUNT - MIN_FILL_PIXELS);
+    int fill_pixels = (int)(fill_pixels_float + 0.5f);  /* Round to nearest */
+    if (fill_pixels < MIN_FILL_PIXELS) fill_pixels = MIN_FILL_PIXELS;
+    if (fill_pixels > RGBW_LED_COUNT) fill_pixels = RGBW_LED_COUNT;
+    
+    for (int i = 0; i < RGBW_LED_COUNT; i++) {
+        float pixel_brightness = 0.0f;
+        
+        if (i < fill_pixels) {
+            /* This pixel is within the filled region */
+            /* Calculate position within the gradient (0 = head, 1 = tail) */
+            float gradient_pos = (fill_pixels > 1) ? (float)i / (float)(fill_pixels - 1) : 0.0f;
+            
+            /* Lerp from HEAD_BRIGHTNESS to TAIL_BRIGHTNESS */
+            pixel_brightness = HEAD_BRIGHTNESS - gradient_pos * (HEAD_BRIGHTNESS - TAIL_BRIGHTNESS);
+        }
+        /* Pixels beyond fill_pixels remain at 0 */
+        
+        /* Set warm white only (W channel) */
+        uint8_t w_value = (uint8_t)(pixel_brightness * 255.0f);
+        set_pixel_rgbw(i, 0, 0, 0, w_value);
+    }
+    
+    refresh_strip();
 }
 
 /* ============================================================================
@@ -1532,6 +1866,7 @@ static void draw_stars(bool reset)
         float speed;       /* How fast this star evolves */
         float peak_point;  /* Where in the phase the star peaks (asymmetric) */
         float size_mult;   /* Size multiplier for variation (0.7-1.3) */
+        bool has_blue;     /* 25% of stars get slight blue tint in trails */
     } stars[MAX_STARS];
     static bool initialized = false;
     static uint32_t rand_seed = 54321;
@@ -1599,21 +1934,24 @@ static void draw_stars(bool reset)
                     /* Size variation for visual diversity (0.7 to 1.3) */
                     stars[free_slot].size_mult = 0.7f + (STAR_RAND() % 100) * 0.006f;
                     
-                    /* MUCH slower speeds for gradual organic twinkling
-                       At 60fps, speed of 0.001 = 1000 frames = ~16 seconds lifecycle */
+                    /* 25% of stars get slight blue tint in trails */
+                    stars[free_slot].has_blue = ((STAR_RAND() % 4) == 0);
+                    
+                    /* Smooth but faster transitions - ease in/out makes them feel natural
+                       At 60fps: speed of 0.008 = 125 frames = ~2 seconds lifecycle */
                     float base_speed, speed_var;
                     if (type == STAR_SUPERNOVA) {
-                        /* Supernovas: 8-12 seconds lifecycle */
-                        base_speed = 0.0012f;
-                        speed_var = 0.0004f;
-                    } else if (type == STAR_BRIGHT) {
-                        /* Bright stars: 4-7 seconds lifecycle */
-                        base_speed = 0.002f;
-                        speed_var = 0.001f;
-                    } else {
-                        /* Dim stars: 2-4 seconds lifecycle */
-                        base_speed = 0.004f;
+                        /* Supernovas: 3-4 seconds lifecycle */
+                        base_speed = 0.005f;
                         speed_var = 0.002f;
+                    } else if (type == STAR_BRIGHT) {
+                        /* Bright stars: 2-3 seconds lifecycle */
+                        base_speed = 0.007f;
+                        speed_var = 0.003f;
+                    } else {
+                        /* Dim stars: 1-2 seconds lifecycle */
+                        base_speed = 0.012f;
+                        speed_var = 0.005f;
                     }
                     stars[free_slot].speed = base_speed + (STAR_RAND() % 100) * speed_var * 0.01f;
                     
@@ -1633,8 +1971,8 @@ static void draw_stars(bool reset)
     
     /* No blue floor - stars should emerge from pure darkness */
     
-    /* Advance twinkle time (slow progression for gentle organic twinkle) */
-    twinkle_time += 0.05f;  /* Slow progression for gentle breathing effect */
+    /* Advance twinkle time (ultra slow for butter-smooth breathing) */
+    twinkle_time += 0.02f;  /* Very slow progression for silky smooth effect */
     if (twinkle_time > 10000.0f) twinkle_time -= 10000.0f;  /* Prevent overflow */
     
     /* Update and draw each star */
@@ -1707,93 +2045,68 @@ static void draw_stars(bool reset)
         if (brightness > 1.0f) brightness = 1.0f;
         
         /* Star properties based on type:
-           - Center: pure W channel (warm white core)
-           - Trails: RGB only with strong exponential falloff
-           - Each type has different color bias for trail hue variety */
+           - Center: warm white (W channel only)
+           - Trails: cold white (RGB equal) with halving falloff
+           - Random pixels get slight blue tint for variety */
         float max_w;              /* W channel brightness for center */
-        int halo_radius;          /* Trail length (pixels) */
-        float falloff_rate;       /* Exponential falloff strength (higher = tighter) */
-        float trail_r_bias;       /* Red component in trail (0-1) */
-        float trail_g_bias;       /* Green component in trail (0-1) */
-        float trail_b_bias;       /* Blue component in trail (0-1) */
-        float trail_intensity;    /* Overall trail brightness */
+        int halo_radius;          /* Trail length (pixels on each side) */
+        float trail_intensity;    /* Starting trail brightness */
         
         /* Use stored size variation for this star */
         float size_variation = stars[s].size_mult;
         
         switch (stars[s].type) {
             case STAR_SUPERNOVA:
-                /* Big flare: warm white core, cold white trail with VERY slight blue-purple hint */
+                /* Big flare: warm white core, 3-4 pixels each side */
                 max_w = 255.0f * size_variation;
-                halo_radius = 7;       /* 6-7 pixels spread */
-                falloff_rate = 3.5f;   /* Visible but fades */
-                trail_r_bias = 0.95f;  /* Almost pure white */
-                trail_g_bias = 0.90f;  /* Tiny bit less green = slight purple */
-                trail_b_bias = 1.0f;   /* Very subtle blue-purple tint */
-                trail_intensity = 100.0f;
+                halo_radius = 4;       /* 3-4 pixels on each side */
+                trail_intensity = 120.0f;
                 break;
             case STAR_BRIGHT:
-                /* Medium star: warm core, pure cold white trails */
+                /* Medium star: warm core, 2-3 pixels each side */
                 max_w = 180.0f * size_variation;
-                halo_radius = 5;       /* 4-5 pixels spread */
-                falloff_rate = 4.5f;   /* Tighter falloff */
-                trail_r_bias = 1.0f;   /* Pure cold white */
-                trail_g_bias = 1.0f;   /* Equal RGB = white */
-                trail_b_bias = 1.0f;   /* No color bias */
-                trail_intensity = 70.0f;
+                halo_radius = 3;       /* 2-3 pixels on each side */
+                trail_intensity = 80.0f;
                 break;
             default: /* STAR_DIM */
-                /* Small twinkle: subtle warm core, tight cold white trail */
-                max_w = 80.0f * size_variation;
-                halo_radius = 3;       /* 2-3 pixels spread */
-                falloff_rate = 6.0f;   /* Very tight falloff */
-                trail_r_bias = 1.0f;   /* Pure cold white */
-                trail_g_bias = 1.0f;   /* Equal RGB = white */
-                trail_b_bias = 1.0f;   /* No color bias */
-                trail_intensity = 40.0f;
+                /* Small twinkle: subtle warm core, 1-2 pixels each side */
+                max_w = 100.0f * size_variation;
+                halo_radius = 2;       /* 1-2 pixels on each side */
+                trail_intensity = 50.0f;
                 break;
         }
         
-        /* Draw the star center - primarily W CHANNEL for warm white core */
+        /* Draw the star center - WARM WHITE (W channel only) */
         int pos = stars[s].pos;
         pixel_w[pos] += brightness * max_w;
         
-        /* Only Supernovas get a tiny hint of cold white RGB at the very center */
-        if (stars[s].type == STAR_SUPERNOVA) {
-            float center_rgb = brightness * 20.0f;  /* Very subtle */
-            pixel_r[pos] += center_rgb;
-            pixel_g[pos] += center_rgb;
-            pixel_b[pos] += center_rgb;
-        }
+        /* Draw cold white trails with HALVING falloff (each pixel = half previous) */
+        float current_intensity = trail_intensity * brightness;
         
-        /* Draw RGB trails with STRONG exponential falloff */
+        /* Blue tint: only 1 in 4 stars get +5 extra blue in trails */
+        float blue_bonus = stars[s].has_blue ? 5.0f : 0.0f;
+        
         for (int offset = 1; offset <= halo_radius; offset++) {
-            /* Strong exponential falloff - each step drops sharply */
-            float falloff = expf(-falloff_rate * (float)offset / (float)halo_radius);
+            /* Halving falloff - each step is half the previous */
+            current_intensity *= 0.5f;
             
-            /* Trail colors - RGB only, biased by star type (mostly blue) */
-            float trail_r = brightness * trail_intensity * trail_r_bias * falloff;
-            float trail_g = brightness * trail_intensity * trail_g_bias * falloff;
-            float trail_b = brightness * trail_intensity * trail_b_bias * falloff;
-            
-            /* NO W channel in trails - trails are pure RGB */
+            /* Cold white trail (equal R, G, B) - most stars are pure white */
+            float trail_val = current_intensity;
             
             /* Left neighbor */
             int left = pos - offset;
             if (left >= 0 && left < 60) {
-                pixel_r[left] += trail_r;
-                pixel_g[left] += trail_g;
-                pixel_b[left] += trail_b;
-                /* No pixel_w for trails! */
+                pixel_r[left] += trail_val;
+                pixel_g[left] += trail_val;
+                pixel_b[left] += trail_val + blue_bonus;  /* +5 blue for 25% of stars */
             }
             
             /* Right neighbor */
             int right = pos + offset;
             if (right >= 0 && right < RGBW_LED_COUNT && right < 60) {
-                pixel_r[right] += trail_r;
-                pixel_g[right] += trail_g;
-                pixel_b[right] += trail_b;
-                /* No pixel_w for trails! */
+                pixel_r[right] += trail_val;
+                pixel_g[right] += trail_val;
+                pixel_b[right] += trail_val + blue_bonus;  /* +5 blue for 25% of stars */
             }
         }
     }
@@ -2035,32 +2348,17 @@ void app_main(void)
     ESP_LOGI(TAG, ">>> STEP 1e: Initializing passive buzzer...");
     init_buzzer();
     
+    /* Step 1f: Initialize melody task for background playback */
+    ESP_LOGI(TAG, ">>> STEP 1f: Starting melody background task...");
+    init_melody_task();
+    
     /* ========================================================================
-       STANDBY MODE ON STARTUP
-       Wait in standby until power button is pressed.
-       Onboard LED: dim orange pulsing.
+       AUTO-BOOT ON STARTUP
+       Device automatically boots and runs on power-up.
+       Press power button (BOOT) during operation to enter standby.
        ======================================================================== */
     
-    /* Check if we're coming from a restart (button was pressed in standby)
-       We use a flag in RTC memory to skip standby on restart after button press */
-    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
-    
-    /* On cold boot or reset (not from restart), go to standby first */
-    if (wakeup_cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
-        /* Check for special marker - if we restarted from standby, skip this */
-        /* For now, we'll just check if button is already pressed at boot */
-        if (!is_power_button_pressed()) {
-            ESP_LOGI(TAG, ">>> Cold boot detected, entering standby mode...");
-            run_standby_mode();
-            /* Button was pressed in standby - continue with boot */
-        }
-    }
-    
-    /* Wait for button release if it's still pressed */
-    while (is_power_button_pressed()) {
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-    }
-    vTaskDelay(200 / portTICK_PERIOD_MS);  /* Debounce */
+    ESP_LOGI(TAG, ">>> Auto-boot enabled - starting immediately...");
 
     /* ========================================================================
        STARTUP SEQUENCE (only runs after button press from standby)
@@ -2117,13 +2415,24 @@ void app_main(void)
     const int batch_size = 3;          /* Sweep 3 LEDs at a time */
     int test_color_phase = 0;          /* 0=Red, 1=Green, 2=Blue, 3=Full white, 4=Complete */
     bool led_test_complete = false;
+    
+    /* Buzzer test state - sweep through frequency spectrum */
+    bool buzzer_test_complete = false;
+    int buzzer_freq = 200;             /* Start at 200Hz (low tone) */
+    const int buzzer_freq_max = 4000;  /* End at 4000Hz (high tone) */
+    const int buzzer_freq_step = 100;  /* Step by 100Hz each tone */
+    int buzzer_frame_count = 0;
+    const int buzzer_frames_per_tone = 3;  /* Hold each frequency for 3 frames (~50ms) */
+    int buzzer_phase = 0;              /* 0=sweep up, 1=hold at max, 2=sweep down */
+    int buzzer_hold_frames = 0;        /* Counter for hold phase */
 
     ESP_LOGI(TAG, "    Onboard: Breathing light blue while connecting to '%s'", WIFI_SSID);
     ESP_LOGI(TAG, "    Strip:   RGB scan (batches of %d) → 5s full white test", batch_size);
-    ESP_LOGI(TAG, "    Both sequences must complete before entering main loop.");
+    ESP_LOGI(TAG, "    Buzzer:  Frequency sweep 200Hz → 4000Hz");
+    ESP_LOGI(TAG, "    All THREE sequences must complete before entering main loop.");
 
-    /* Loop until BOTH WiFi is connected AND LED test is complete */
-    while (!led_test_complete || wifi_status == 0) {
+    /* Loop until ALL THREE are complete: WiFi + LED test + Buzzer test */
+    while (!led_test_complete || !buzzer_test_complete || wifi_status == 0) {
         /* === ONBOARD LED: Breathing light blue === */
         float eased = ease_in_out(breath_t);
         uint8_t r = (uint8_t)(wifi_max_r * eased);
@@ -2183,13 +2492,68 @@ void app_main(void)
                     }
                 }
             } else if (test_color_phase == 3) {
-                /* Phase 3: FULL WHITE BLAST for 5 seconds (power draw test) */
-                ESP_LOGI(TAG, "    Strip:   100%% WHITE (W channel) for 5 seconds...");
-                for (int i = 0; i < RGBW_LED_COUNT; i++) {
-                    set_pixel_rgbw(i, 0, 0, 0, 255);
+                /* Phase 3a: Gradual ramp-up from 0 to full white (2 seconds) */
+                ESP_LOGI(TAG, "    Strip:   Ramping up WHITE (W channel) 0%% -> 100%%...");
+                const int ramp_duration_ms = 2000;  /* 2 seconds ramp */
+                const int ramp_steps = 100;         /* Smooth 100 steps */
+                const int step_delay_ms = ramp_duration_ms / ramp_steps;
+                
+                for (int step = 0; step <= ramp_steps; step++) {
+                    uint8_t brightness = (uint8_t)((step * 255) / ramp_steps);
+                    for (int i = 0; i < RGBW_LED_COUNT; i++) {
+                        set_pixel_rgbw(i, 0, 0, 0, brightness);
+                    }
+                    refresh_strip();
+                    vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
                 }
-                refresh_strip();
-                vTaskDelay(5000 / portTICK_PERIOD_MS);
+                
+                /* Phase 3b: Hold at full white for 2 seconds */
+                ESP_LOGI(TAG, "    Strip:   Holding 100%% WHITE for 2 seconds...");
+                vTaskDelay(2000 / portTICK_PERIOD_MS);
+                
+                /* Phase 3c: ACCELERATING STROBE TEST for 3.5 seconds */
+                ESP_LOGI(TAG, "    Strip:   STROBE TEST - accelerating from 0.5s to max speed...");
+                int64_t strobe_start = esp_timer_get_time();
+                int64_t strobe_duration = 3500000;  /* 3.5 seconds in microseconds */
+                int strobe_count = 0;
+                bool strobe_on = true;
+                
+                /* Strobe timing: start at 500ms interval, end at ~1ms (as fast as possible) */
+                const int start_delay_ms = 500;  /* Start: 0.5 second between toggles */
+                const int end_delay_ms = 1;      /* End: as fast as possible */
+                
+                while ((esp_timer_get_time() - strobe_start) < strobe_duration) {
+                    int64_t elapsed = esp_timer_get_time() - strobe_start;
+                    float progress = (float)elapsed / (float)strobe_duration;  /* 0.0 to 1.0 */
+                    
+                    /* Use exponential curve for more dramatic acceleration at the end */
+                    /* progress^3 makes it stay slow longer then ramp up quickly */
+                    float curve = progress * progress * progress;
+                    
+                    /* Interpolate delay: start_delay -> end_delay */
+                    int current_delay_ms = start_delay_ms - (int)(curve * (start_delay_ms - end_delay_ms));
+                    if (current_delay_ms < end_delay_ms) current_delay_ms = end_delay_ms;
+                    
+                    if (strobe_on) {
+                        /* All LEDs ON (full white) */
+                        for (int i = 0; i < RGBW_LED_COUNT; i++) {
+                            set_pixel_rgbw(i, 0, 0, 0, 255);
+                        }
+                    } else {
+                        /* All LEDs OFF */
+                        for (int i = 0; i < RGBW_LED_COUNT; i++) {
+                            set_pixel_rgbw(i, 0, 0, 0, 0);
+                        }
+                    }
+                    refresh_strip();
+                    strobe_on = !strobe_on;
+                    strobe_count++;
+                    
+                    /* Delay with current interval (gets shorter over time) */
+                    vTaskDelay(current_delay_ms / portTICK_PERIOD_MS);
+                }
+                
+                ESP_LOGI(TAG, "    Strip:   Strobe complete! %d toggles in 3.5 seconds", strobe_count);
                 
                 /* Drop to 10% white */
                 ESP_LOGI(TAG, "    Strip:   LED test COMPLETE. Holding 10%% white.");
@@ -2207,6 +2571,54 @@ void app_main(void)
             led_test_complete = true;  /* No strip, skip test */
         }
         
+        /* === BUZZER TEST: Frequency sweep up, hold, sweep down === */
+        if (!buzzer_test_complete && buzzer_initialized) {
+            buzzer_frame_count++;
+            
+            if (buzzer_phase == 0) {
+                /* Phase 0: Sweep UP (200Hz → 4000Hz) */
+                if (buzzer_frame_count >= buzzer_frames_per_tone) {
+                    buzzer_frame_count = 0;
+                    buzzer_tone(buzzer_freq, 40);
+                    buzzer_freq += buzzer_freq_step;
+                    
+                    if (buzzer_freq >= buzzer_freq_max) {
+                        buzzer_freq = buzzer_freq_max;
+                        buzzer_phase = 1;
+                        buzzer_hold_frames = 0;
+                        ESP_LOGI(TAG, "    Buzzer: Holding at 4000Hz...");
+                    }
+                }
+            } else if (buzzer_phase == 1) {
+                /* Phase 1: HOLD at max frequency for ~1 second */
+                buzzer_tone(buzzer_freq_max, 16);  /* Continuous tone */
+                buzzer_hold_frames++;
+                
+                if (buzzer_hold_frames >= 60) {  /* ~1 second at 60fps */
+                    buzzer_phase = 2;
+                    buzzer_frame_count = 0;
+                    ESP_LOGI(TAG, "    Buzzer: Sweeping down...");
+                }
+            } else if (buzzer_phase == 2) {
+                /* Phase 2: Quick sweep DOWN (4000Hz → 200Hz → silence) */
+                buzzer_frame_count++;
+                if (buzzer_frame_count >= 1) {  /* Fast! Every frame */
+                    buzzer_frame_count = 0;
+                    buzzer_freq -= 200;  /* Fast descent (200Hz per frame) */
+                    
+                    if (buzzer_freq <= 0) {
+                        buzzer_stop();
+                        buzzer_test_complete = true;
+                        ESP_LOGI(TAG, "    >>> BUZZER TEST FINISHED");
+                    } else {
+                        buzzer_tone(buzzer_freq, 16);
+                    }
+                }
+            }
+        } else if (!buzzer_initialized) {
+            buzzer_test_complete = true;  /* No buzzer, skip test */
+        }
+        
         /* Check WiFi status */
         if (wifi_status == 0) {
             wifi_status = wifi_check_status();
@@ -2218,7 +2630,7 @@ void app_main(void)
         vTaskDelay(16 / portTICK_PERIOD_MS);  /* 60 FPS */
     }
     
-    ESP_LOGI(TAG, ">>> Both sequences complete! Proceeding to main loop...");
+    ESP_LOGI(TAG, ">>> All THREE sequences complete! Proceeding to main loop...");
     
     /* ========================================================================
        END OF STARTUP BOOT SEQUENCE
@@ -2298,6 +2710,55 @@ void app_main(void)
     while (1) {
         /* Update brightness from potentiometer (smoothed reading) */
         read_potentiometer();
+        
+        /* Check if pot is being adjusted - show brightness gauge instead of animation */
+        if (is_pot_adjusting()) {
+            draw_brightness_gauge();
+            
+            /* Still update onboard LED rainbow */
+            float hue = onboard_rainbow;
+            float c = 1.0f;
+            float x = 1.0f - fabsf(fmodf(hue / 60.0f, 2.0f) - 1.0f);
+            float r1, g1, b1;
+            if (hue < 60)       { r1 = c; g1 = x; b1 = 0; }
+            else if (hue < 120) { r1 = x; g1 = c; b1 = 0; }
+            else if (hue < 180) { r1 = 0; g1 = c; b1 = x; }
+            else if (hue < 240) { r1 = 0; g1 = x; b1 = c; }
+            else if (hue < 300) { r1 = x; g1 = 0; b1 = c; }
+            else                { r1 = c; g1 = 0; b1 = x; }
+            set_onboard_led_rgb_internal((uint8_t)(r1 * 80), (uint8_t)(g1 * 80), (uint8_t)(b1 * 80));
+            onboard_rainbow += 0.4f;
+            if (onboard_rainbow >= 360.0f) onboard_rainbow -= 360.0f;
+            
+            /* Check power button even during gauge display */
+            if (is_power_button_pressed()) {
+                vTaskDelay(50 / portTICK_PERIOD_MS);
+                if (is_power_button_pressed()) {
+                    ESP_LOGI(TAG, "Power button pressed, entering standby...");
+                    buzzer_chime_down();
+                    while (is_power_button_pressed()) {
+                        vTaskDelay(50 / portTICK_PERIOD_MS);
+                    }
+                    vTaskDelay(100 / portTICK_PERIOD_MS);
+                    enter_standby_mode();
+                }
+            }
+            
+            /* Check melody button during gauge display too */
+            if (is_melody_button_pressed() && !melody_playing) {
+                vTaskDelay(50 / portTICK_PERIOD_MS);
+                if (is_melody_button_pressed()) {
+                    while (is_melody_button_pressed()) {
+                        vTaskDelay(50 / portTICK_PERIOD_MS);
+                    }
+                    vTaskDelay(50 / portTICK_PERIOD_MS);
+                    buzzer_play_random_song();
+                }
+            }
+            
+            vTaskDelay(animation_delay_ms / portTICK_PERIOD_MS);
+            continue;  /* Skip normal animation this frame */
+        }
         
         /* Get current animation mode (may change from MQTT at any time) */
         animation_mode_t mode = current_animation;
@@ -2416,7 +2877,7 @@ void app_main(void)
         onboard_rainbow += 0.4f;  /* ~12 degrees/second at 30fps */
         if (onboard_rainbow >= 360.0f) onboard_rainbow -= 360.0f;
         
-        /* === CHECK POWER BUTTON === */
+        /* === CHECK POWER BUTTON (BOOT button - GPIO9) === */
         if (is_power_button_pressed()) {
             /* Debounce: wait for release and confirm it was intentional */
             vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -2431,6 +2892,22 @@ void app_main(void)
                 
                 /* Enter standby mode (this doesn't return - will restart) */
                 enter_standby_mode();
+            }
+        }
+        
+        /* === CHECK MELODY BUTTON (External button - GPIO5) === */
+        if (is_melody_button_pressed() && !melody_playing) {
+            /* Debounce */
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            if (is_melody_button_pressed()) {
+                /* Wait for button release before playing */
+                while (is_melody_button_pressed()) {
+                    vTaskDelay(50 / portTICK_PERIOD_MS);
+                }
+                vTaskDelay(50 / portTICK_PERIOD_MS);  /* Debounce release */
+                
+                /* Play a random song (this is blocking but that's OK) */
+                buzzer_play_random_song();
             }
         }
         
