@@ -1,0 +1,210 @@
+(kicad_sch
+  (version 20230121)
+  (generator "hand_coded")
+  (uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+  (paper "A4")
+  
+  (title_block
+    (title "ESP32-C6 LED Controller")
+    (date "2024-12-24")
+    (rev "1.0")
+    (comment 1 "60x NeoPixels + Charlieplex Matrix + nOOds")
+    (comment 2 "Power: 12V 5A input, 5V 6A buck converter")
+  )
+
+  ;; Power Input Section
+  (text "=== 12V POWER INPUT ===" (at 25 25) (effects (font (size 2 2))))
+  
+  (symbol
+    (lib_id "Connector:Barrel_Jack_Switch")
+    (at 30 40)
+    (unit 1)
+    (uuid "j1-barrel")
+    (property "Reference" "J1" (at 30 32 0))
+    (property "Value" "12V_5A_INPUT" (at 30 50 0))
+  )
+
+  (symbol
+    (lib_id "Device:CP")
+    (at 50 40)
+    (unit 1)
+    (uuid "c1-input")
+    (property "Reference" "C1" (at 52 38 0))
+    (property "Value" "100uF/25V" (at 52 42 0))
+    (property "Description" "Input filter capacitor")
+  )
+
+  ;; Buck Converter Section
+  (text "=== BUCK CONVERTER 12V to 5V ===" (at 25 60) (effects (font (size 2 2))))
+  
+  (symbol
+    (lib_id "Regulator_Switching:LM2596")
+    (at 80 75)
+    (unit 1)
+    (uuid "u1-buck")
+    (property "Reference" "U1" (at 80 65 0))
+    (property "Value" "BUCK_12V_to_5V_6A" (at 80 85 0))
+    (property "Description" "Use Pololu D24V60F5 or similar 5V 6A module")
+  )
+
+  (symbol
+    (lib_id "Device:CP")
+    (at 110 75)
+    (unit 1)
+    (uuid "c2-bulk")
+    (property "Reference" "C2" (at 112 73 0))
+    (property "Value" "1000uF/10V" (at 112 77 0))
+    (property "Description" "Bulk capacitor for LED current spikes - CRITICAL")
+  )
+
+  ;; ESP32-C6 Section
+  (text "=== ESP32-C6 MICROCONTROLLER ===" (at 25 100) (effects (font (size 2 2))))
+  
+  (symbol
+    (lib_id "MCU_Espressif:ESP32-C6")
+    (at 60 140)
+    (unit 1)
+    (uuid "u2-esp32")
+    (property "Reference" "U2" (at 60 110 0))
+    (property "Value" "ESP32-C6-WROOM" (at 60 115 0))
+  )
+
+  (symbol
+    (lib_id "Device:C")
+    (at 35 130)
+    (unit 1)
+    (uuid "c4-mcu")
+    (property "Reference" "C4" (at 37 128 0))
+    (property "Value" "10uF" (at 37 132 0))
+    (property "Description" "MCU decoupling capacitor near VIN")
+  )
+
+  ;; NeoPixel Section
+  (text "=== NEOPIXEL STRIP (60x SK6812 RGBW) ===" (at 130 100) (effects (font (size 2 2))))
+  
+  (symbol
+    (lib_id "Device:R")
+    (at 115 130)
+    (unit 1)
+    (uuid "r1-data")
+    (property "Reference" "R1" (at 117 128 0))
+    (property "Value" "330R" (at 117 132 0))
+    (property "Description" "Data line resistor - prevents reflections, protects GPIO")
+  )
+
+  (symbol
+    (lib_id "Device:CP")
+    (at 150 120)
+    (unit 1)
+    (uuid "c3-neo")
+    (property "Reference" "C3" (at 152 118 0))
+    (property "Value" "100uF/10V" (at 152 122 0))
+    (property "Description" "Local decoupling near NeoPixel strip input")
+  )
+
+  (symbol
+    (lib_id "LED:SK6812")
+    (at 170 140)
+    (unit 1)
+    (uuid "led1-neo")
+    (property "Reference" "LED1-60" (at 170 130 0))
+    (property "Value" "60x_SK6812_RGBW" (at 170 150 0))
+  )
+
+  ;; I2C Charlieplex Section  
+  (text "=== I2C CHARLIEPLEX MATRIX ===" (at 130 170) (effects (font (size 2 2))))
+
+  (symbol
+    (lib_id "Device:R")
+    (at 115 190)
+    (unit 1)
+    (uuid "r3-sda")
+    (property "Reference" "R3" (at 117 188 0))
+    (property "Value" "4.7K" (at 117 192 0))
+    (property "Description" "I2C SDA pull-up to 3.3V")
+  )
+
+  (symbol
+    (lib_id "Device:R")
+    (at 125 190)
+    (unit 1)
+    (uuid "r4-scl")
+    (property "Reference" "R4" (at 127 188 0))
+    (property "Value" "4.7K" (at 127 192 0))
+    (property "Description" "I2C SCL pull-up to 3.3V")
+  )
+
+  (symbol
+    (lib_id "Driver_LED:IS31FL3731")
+    (at 160 200)
+    (unit 1)
+    (uuid "u3-charlie")
+    (property "Reference" "U3" (at 160 180 0))
+    (property "Value" "IS31FL3731" (at 160 185 0))
+  )
+
+  (symbol
+    (lib_id "Device:C")
+    (at 140 195)
+    (unit 1)
+    (uuid "c5-i2c")
+    (property "Reference" "C5" (at 142 193 0))
+    (property "Value" "0.1uF" (at 142 197 0))
+    (property "Description" "High-frequency decoupling for I2C driver")
+  )
+
+  (symbol
+    (lib_id "Display:LED_Matrix_9x16")
+    (at 200 200)
+    (unit 1)
+    (uuid "disp1")
+    (property "Reference" "DISP1" (at 200 185 0))
+    (property "Value" "9x16_Charlieplex_Blue" (at 200 215 0))
+  )
+
+  ;; nOOds 12V Section
+  (text "=== nOOds 12V LED FILAMENT ===" (at 25 180) (effects (font (size 2 2))))
+
+  (symbol
+    (lib_id "Device:R")
+    (at 45 200)
+    (unit 1)
+    (uuid "r2-gate")
+    (property "Reference" "R2" (at 47 198 0))
+    (property "Value" "10K" (at 47 202 0))
+    (property "Description" "MOSFET gate pull-down - ensures OFF at boot")
+  )
+
+  (symbol
+    (lib_id "Transistor_FET:IRLZ44N")
+    (at 60 210)
+    (unit 1)
+    (uuid "q1-mosfet")
+    (property "Reference" "Q1" (at 65 205 0))
+    (property "Value" "IRLZ44N" (at 65 215 0))
+    (property "Description" "Logic-level N-MOSFET for 12V switching")
+  )
+
+  (symbol
+    (lib_id "Device:LED")
+    (at 80 195)
+    (unit 1)
+    (uuid "noods1")
+    (property "Reference" "NOODS1" (at 80 188 0))
+    (property "Value" "nOOds_600mm_12V" (at 80 205 0))
+  )
+
+  ;; Net Labels (connections)
+  (label "12V" (at 45 35))
+  (label "5V" (at 105 70))
+  (label "3V3" (at 40 125))
+  (label "GND" (at 45 45))
+  (label "GPIO4_NEOPIXEL" (at 85 135))
+  (label "GPIO5_NOODS_PWM" (at 85 145))
+  (label "GPIO6_SDA" (at 85 150))
+  (label "GPIO7_SCL" (at 85 155))
+  (label "NEOPIXEL_DATA" (at 130 135))
+  (label "I2C_SDA" (at 140 195))
+  (label "I2C_SCL" (at 140 200))
+)
+

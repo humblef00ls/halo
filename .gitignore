@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+sdkconfig
+sdkconfig.old
+
+# Managed components (downloaded on build)
+managed_components/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Dependencies lock (regenerated on build)
+dependencies.lock
+
+# Credentials (NEVER commit this!)
+main/credentials.h
+
