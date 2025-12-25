@@ -45,7 +45,12 @@
 #include "esp_adc/adc_oneshot.h"
 #include "driver/ledc.h"  /* PWM for passive buzzer */
 #include "esp_random.h"   /* For esp_random() in song selection */
+#include "esp_system.h"   /* For esp_get_free_heap_size(), chip info */
+#include "esp_heap_caps.h" /* For heap_caps_get_free_size() */
+#include "esp_timer.h"    /* For esp_timer_get_time() */
 #include "credentials.h"  /* WiFi and Adafruit IO credentials (gitignored) */
+#include "zigbee_hub.h"   /* Zigbee coordinator for blind control */
+#include "zigbee_devices.h" /* Zigbee device storage */
 
 /* Logging tags for different components */
 static const char *TAG = "main";
@@ -53,6 +58,7 @@ static const char *TAG_ONBOARD = "onboard_led";
 static const char *TAG_RGBW = "rgbw_neopixel";
 static const char *TAG_NVS = "nvs_storage";
 static const char *TAG_WIFI = "wifi";
+static const char *TAG_METRICS = "metrics";
 
 /* ============================================================================
    WIFI STATION CONFIGURATION
@@ -390,13 +396,11 @@ static float read_potentiometer(void)
     if (pot_brightness < min_brightness) pot_brightness = min_brightness;
     if (pot_brightness > max_brightness) pot_brightness = max_brightness;
     
-    /* Log once per second at 60fps */
-    static int log_counter = 0;
-    log_counter++;
-    if (log_counter >= 60) {
-        log_counter = 0;
-        ESP_LOGI(TAG_POT, "Raw: %d, Master Brightness: %.0f%%", 
-                 raw_value, pot_brightness * 100);
+    /* Only log when brightness changes significantly (>2% change) */
+    static float last_logged_brightness = -1.0f;
+    if (fabsf(pot_brightness - last_logged_brightness) > 0.02f) {
+        last_logged_brightness = pot_brightness;
+        ESP_LOGI(TAG_POT, "Brightness changed to %.0f%%", pot_brightness * 100);
     }
     
     return pot_brightness;
@@ -420,6 +424,49 @@ static bool is_pot_adjusting(void)
     }
     
     return (pot_idle_frames < POT_GAUGE_TIMEOUT);
+}
+
+/* ============================================================================
+   SYSTEM METRICS LOGGING
+   ============================================================================
+   Logs CPU/memory metrics every 30 seconds for remote monitoring.
+   ============================================================================ */
+
+static void log_system_metrics(void)
+{
+    /* Only log every 30 seconds (at 60 FPS = 1800 frames) */
+    static int metrics_frame_counter = 0;
+    metrics_frame_counter++;
+    
+    if (metrics_frame_counter < 1800) {  /* 30 seconds at 60 FPS */
+        return;
+    }
+    metrics_frame_counter = 0;
+    
+    /* Get heap memory stats */
+    size_t free_heap = esp_get_free_heap_size();
+    size_t min_free_heap = esp_get_minimum_free_heap_size();
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    
+    /* Get uptime */
+    int64_t uptime_us = esp_timer_get_time();
+    int uptime_sec = (int)(uptime_us / 1000000);
+    int uptime_min = uptime_sec / 60;
+    int uptime_hrs = uptime_min / 60;
+    
+    /* Log metrics */
+    ESP_LOGI(TAG_METRICS, "=== System Metrics ===");
+    ESP_LOGI(TAG_METRICS, "Uptime: %dh %dm %ds", 
+             uptime_hrs, uptime_min % 60, uptime_sec % 60);
+    ESP_LOGI(TAG_METRICS, "Heap: %u KB free (min: %u KB, internal: %u KB)",
+             (unsigned)(free_heap / 1024), 
+             (unsigned)(min_free_heap / 1024),
+             (unsigned)(free_internal / 1024));
+    ESP_LOGI(TAG_METRICS, "Zigbee: %s, %d devices",
+             zigbee_is_network_ready() ? "ready" : "not ready",
+             zigbee_get_device_count());
+    ESP_LOGI(TAG_METRICS, "Animation: mode %d, speed %.2f, brightness %.0f%%",
+             current_animation, animation_speed, pot_brightness * 100);
 }
 
 /* ============================================================================
@@ -1031,6 +1078,41 @@ static void handle_mqtt_command(const char *data, int data_len)
         current_animation = ANIM_SOLID;
         ESP_LOGI(TAG_MQTT, "Color: WARM WHITE");
     }
+    /* ========================================================================
+       ZIGBEE BLIND CONTROL COMMANDS
+       ======================================================================== */
+    else if (strcmp(command, "blinds:pair") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Opening network for pairing (60s)...");
+        zigbee_permit_join(60);
+    }
+    else if (strcmp(command, "blinds:open") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Opening blinds");
+        zigbee_blind_open(0);  /* 0 = first paired blind */
+    }
+    else if (strcmp(command, "blinds:close") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Closing blinds");
+        zigbee_blind_close(0);
+    }
+    else if (strcmp(command, "blinds:stop") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Stopping blinds");
+        zigbee_blind_stop(0);
+    }
+    else if (strncmp(command, "blinds:", 7) == 0) {
+        /* blinds:XX where XX is a percentage (0-100) */
+        int percent = atoi(command + 7);
+        if (percent >= 0 && percent <= 100) {
+            ESP_LOGI(TAG_MQTT, "Zigbee: Setting blinds to %d%%", percent);
+            zigbee_blind_set_position(0, (uint8_t)percent);
+        } else {
+            ESP_LOGW(TAG_MQTT, "Invalid blind position: %d", percent);
+        }
+    }
+    else if (strcmp(command, "zigbee:status") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Network %s, %d devices paired",
+                 zigbee_is_network_ready() ? "READY" : "NOT READY",
+                 zigbee_get_device_count());
+        zigbee_devices_print_all();
+    }
     else {
         ESP_LOGW(TAG_MQTT, "Unknown command: '%s'", command);
     }
@@ -1163,7 +1245,7 @@ static bool is_melody_button_pressed(void)
     return gpio_get_level(MELODY_BUTTON_GPIO) == 0;
 }
 
-/* Standby mode: dim orange pulsing on ONBOARD LED only, waiting for button press
+/* Standby mode: dim pink on ONBOARD LED only, waiting for button press
    NO signals sent to NeoPixel GPIO - safe to have nothing connected.
    Returns true when button is pressed (time to wake up) */
 static bool run_standby_mode(void)
@@ -1173,11 +1255,11 @@ static bool run_standby_mode(void)
     ESP_LOGI(TAG, "║     STANDBY MODE - Press button to start                 ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, ">>> NeoPixel GPIO is IDLE - safe to disconnect.");
-    ESP_LOGI(TAG, ">>> Onboard LED: dim orange");
+    ESP_LOGI(TAG, ">>> Onboard LED: dim pink");
     ESP_LOGI(TAG, "");
     
-    /* Set onboard LED to dim orange: R=8, G=3, B=0 */
-    set_onboard_led_rgb_internal(8, 3, 0);
+    /* Set onboard LED to dim pink: R=12, G=2, B=8 */
+    set_onboard_led_rgb_internal(12, 2, 8);
     
     while (1) {
         /* Check for button press */
@@ -2492,10 +2574,10 @@ void app_main(void)
                     }
                 }
             } else if (test_color_phase == 3) {
-                /* Phase 3a: Gradual ramp-up from 0 to full white (2 seconds) */
-                ESP_LOGI(TAG, "    Strip:   Ramping up WHITE (W channel) 0%% -> 100%%...");
-                const int ramp_duration_ms = 2000;  /* 2 seconds ramp */
-                const int ramp_steps = 100;         /* Smooth 100 steps */
+                /* Phase 3a: Gradual ramp-up from 0 to full white (4 seconds) */
+                ESP_LOGI(TAG, "    Strip:   Ramping up WHITE (W channel) 0%% -> 100%% over 4 seconds...");
+                const int ramp_duration_ms = 4000;  /* 4 seconds ramp */
+                const int ramp_steps = 200;         /* More steps for smoother 4s ramp */
                 const int step_delay_ms = ramp_duration_ms / ramp_steps;
                 
                 for (int step = 0; step <= ramp_steps; step++) {
@@ -2507,9 +2589,9 @@ void app_main(void)
                     vTaskDelay(step_delay_ms / portTICK_PERIOD_MS);
                 }
                 
-                /* Phase 3b: Hold at full white for 2 seconds */
-                ESP_LOGI(TAG, "    Strip:   Holding 100%% WHITE for 2 seconds...");
-                vTaskDelay(2000 / portTICK_PERIOD_MS);
+                /* Phase 3b: Hold at full white for 1 second */
+                ESP_LOGI(TAG, "    Strip:   Holding 100%% WHITE for 1 second...");
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
                 
                 /* Phase 3c: ACCELERATING STROBE TEST for 3.5 seconds */
                 ESP_LOGI(TAG, "    Strip:   STROBE TEST - accelerating from 0.5s to max speed...");
@@ -2654,6 +2736,15 @@ void app_main(void)
         /* Start MQTT connection to Adafruit IO */
         ESP_LOGI(TAG, ">>> STEP 3: Starting MQTT connection...");
         mqtt_init();
+        
+        /* Start Zigbee coordinator for blind control */
+        ESP_LOGI(TAG, ">>> STEP 4: Starting Zigbee Hub...");
+        esp_err_t zb_err = zigbee_hub_init();
+        if (zb_err == ESP_OK) {
+            ESP_LOGI(TAG, ">>> Zigbee Hub started successfully!");
+        } else {
+            ESP_LOGE(TAG, ">>> Zigbee Hub failed to start: %s", esp_err_to_name(zb_err));
+        }
     } else {
         ESP_LOGE(TAG, ">>> WiFi FAILED! Fading to blinking red...");
         buzzer_error();  /* Error beeps! */
@@ -2710,6 +2801,9 @@ void app_main(void)
     while (1) {
         /* Update brightness from potentiometer (smoothed reading) */
         read_potentiometer();
+        
+        /* Log system metrics every 30 seconds */
+        log_system_metrics();
         
         /* Check if pot is being adjusted - show brightness gauge instead of animation */
         if (is_pot_adjusting()) {

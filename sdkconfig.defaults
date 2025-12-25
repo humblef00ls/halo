@@ -17,3 +17,21 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 
 # MQTT Configuration
 CONFIG_MQTT_BUFFER_SIZE=1024
+
+# ============================================================================
+# Zigbee Configuration
+# ============================================================================
+# Enable Zigbee stack
+CONFIG_ZB_ENABLED=y
+
+# Coordinator/Router role (required for hub functionality)
+CONFIG_ZB_ZCZR=y
+
+# Use native 802.15.4 radio (ESP32-C6 has built-in support)
+CONFIG_ZB_RADIO_NATIVE=y
+
+# WiFi + Zigbee coexistence (required for simultaneous operation)
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# Zigbee network settings
+CONFIG_ZB_ZED_TIMEOUT=3
