@@ -1,6 +1,10 @@
 # Hamurabi LED Controller - Build Configuration
 # Target: ESP32-C6
 
+# Custom Partition Table (larger app partition for our code)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
 # Onboard LED Configuration
 CONFIG_BLINK_LED_GPIO=y
 CONFIG_BLINK_GPIO=8

@@ -1,234 +1,284 @@
-# Hamurabi LED Controller
+# Halo
 
-A smart LED controller for ESP32-C6 that drives multiple LED types with voice control via Google Home/IFTTT.
+A glowy LED ring thing I'm building. Voice controlled via Google Home, runs on an ESP32-C6.
 
-## Features
+![status: work in progress](https://img.shields.io/badge/status-work%20in%20progress-yellow)
 
-- **Multi-LED Support**
+## What is this?
 
-  - 60× RGBW NeoPixels (SK6812) on GPIO4
-  - Onboard RGB LED (status indicator) on GPIO8
-  - 9×16 Charlieplex Matrix via I2C (planned)
-  - nOOds 12V LED Filament via PWM (planned)
+It's a smart LED controller that drives a ring of 60 RGBW NeoPixels with some nice animations. Eventually it'll also have a charlieplex matrix display and some nOOds (those flexible LED filaments). The whole thing is voice controlled through Google Home.
 
-- **Animations**
+I wanted something that looks cool on my desk and that I can yell at to change colors.
 
-  - Meteor spinner (rotating gradient)
-  - Rainbow cycle
-  - Breathing/pulsing effect
-  - Solid color mode
-  - Fully customizable colors via hex codes
+---
 
-- **Voice Control (via IFTTT + Adafruit IO)**
+## The Animations
 
-  - "Hey Google, activate party mode" → Rainbow animation
-  - "Hey Google, set meteor to blue" → Blue solid color
-  - Full color and animation control via MQTT
+### Cycle Mode (Default)
 
-- **Smart Features**
-  - WiFi connectivity (connects to home network)
-  - Persistent rotation counter (survives reboots)
-  - Startup LED sequence (boot status indication)
-  - Master brightness control
+Automatically switches between Fusion and Wave every 15 seconds.
+
+### Fusion
+
+A gradient that blends from soft white on one end to purple on the other. Static, no movement.
+
+```
+WHITE                                    PURPLE
+  ┃                                        ┃
+  ▼                                        ▼
+  ████████████████████████████████████████
+  W=85 ─────────────────────────────► R=80,B=180
+```
+
+### Wave
+
+A blue pulse that starts at the center, radiates outward in both directions, fully exits the strip, then regenerates from the center again.
+
+```
+Frame 1:  ░░░░░░░██░░░░░░░   (pulse at center)
+Frame 2:  ░░░░██░░░░░██░░░░   (expanding outward)
+Frame 3:  ░░██░░░░░░░░░██░░   (approaching edges)
+Frame 4:  ██░░░░░░░░░░░░░██   (at edges)
+Frame 5:  ░░░░░░░░░░░░░░░░░   (fully exits - all dark)
+Frame 6:  ░░░░░░░██░░░░░░░   (regenerates from center)
+          ↑                 ↑
+        edge             edge
+```
+
+### Meteor
+
+A rotating gradient spinner. One bright "head" pixel with a tail that wraps around the entire ring. The tail fades smoothly down to almost nothing, then jumps back to bright at the head.
+
+```
+    HEAD
+      ↓
+  ████████░░░░░░░░░░░░░░░░░░░░░░░░██████
+  ← tail wraps around ←←←←←←←←←←←←
+```
+
+### Rainbow
+
+Classic HSV color wheel cycling around the ring. Each pixel is a different hue, and the whole thing rotates.
+
+```
+  🔴🟠🟡🟢🔵🟣🔴🟠🟡🟢🔵🟣🔴🟠🟡
+       → rotates →
+```
+
+### Breathing
+
+All pixels pulse in unison. Fades up, fades down, repeat. Uses the current color.
+
+```
+  ████████████████████████████████  (bright)
+  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  (dim)
+  ████████████████████████████████  (bright)
+```
+
+### Solid
+
+Just... a solid color. No animation. Set a color and it stays.
+
+---
 
 ## Hardware
 
-### Required Components
+### What I'm Using
 
-| Component                                                                | Quantity | Purpose                       |
-| ------------------------------------------------------------------------ | -------- | ----------------------------- |
-| [ESP32-C6 Dev Board](https://www.waveshare.com/wiki/ESP32-C6-DEV-KIT-N8) | 1        | Main controller               |
-| RGBW NeoPixel Strip (SK6812)                                             | 60 LEDs  | Main light source             |
-| 12V 5A Power Supply                                                      | 1        | Main power                    |
-| Buck Converter (12V→5V, 6A)                                              | 1        | Step down voltage             |
-| 330Ω Resistor                                                            | 1        | NeoPixel data line protection |
-| 1000µF Capacitor                                                         | 1        | Power smoothing               |
-
-### Optional Components (for full build)
-
-| Component                                                   | Quantity | Purpose                       |
-| ----------------------------------------------------------- | -------- | ----------------------------- |
-| [IS31FL3731 Driver](https://www.adafruit.com/product/2946)  | 1        | Charlieplex matrix controller |
-| [9×16 LED Matrix](https://www.adafruit.com/product/2973)    | 1        | Display matrix                |
-| [nOOds LED Filament](https://www.adafruit.com/product/5731) | 1        | Accent lighting               |
-| IRLZ44N MOSFET                                              | 1        | 12V switching for nOOds       |
-| 10KΩ Resistor                                               | 1        | MOSFET gate pulldown          |
-| 4.7KΩ Resistors                                             | 2        | I2C pull-ups                  |
+| Thing                             | Notes                                                             |
+| --------------------------------- | ----------------------------------------------------------------- |
+| **Waveshare ESP32-C6-DEV-KIT-N8** | The brains. Has WiFi, plenty of GPIO, and a cute onboard RGB LED  |
+| **60× SK6812 RGBW NeoPixels**     | The main event. RGBW means it has a dedicated white LED per pixel |
+| **5V 6A Power Supply**            | Enough juice for full brightness (though I run at 25%)            |
+| **MT3608 Boost Module**           | Steps 5V up to 12V for the nOOds                                  |
+| **IRLB8721 N-MOSFET**             | Switches the 12V nOOds on/off via PWM                             |
+| **1000µF Capacitor**              | Smooths out the power. NeoPixels are current-hungry               |
 
 ### Wiring
 
 ```
-ESP32-C6 Pin    →    Device
-─────────────────────────────
-GPIO4           →    NeoPixel DATA (via 330Ω resistor)
-GPIO5           →    MOSFET Gate (for nOOds)
-GPIO6 (SDA)     →    IS31FL3731 SDA
-GPIO7 (SCL)     →    IS31FL3731 SCL
-GPIO8           →    Onboard RGB LED (built-in)
-VIN (5V)        →    Buck Converter Output
-GND             →    Common Ground
+                    ┌─────────────────┐
+                    │    ESP32-C6     │
+                    │                 │
+    NeoPixels ◄─────┤ GPIO4           │
+                    │                 │
+    nOOds PWM ◄─────┤ GPIO5 ──┐       │
+                    │         │       │
+    I2C SDA ◄───────┤ GPIO6   │       │
+    I2C SCL ◄───────┤ GPIO7   │       │
+                    │         │       │
+    Onboard LED ────┤ GPIO8   │       │
+                    └─────────┼───────┘
+                              │
+                              ▼
+                    ┌─────────────────┐
+                    │   IRLB8721      │
+                    │   N-MOSFET      │
+                    │                 │
+         Gate ◄─────┤                 │
+        (GPIO5)     │                 ├───► nOOds (12V)
+                    │     ┌───┐       │
+         10K ───────┤─────┤   │       │
+        pulldown    │     └───┘       │
+                    │      GND        │
+                    └─────────────────┘
 ```
 
-See `schematics/led_controller.kicad_sch` for the full schematic.
+### Power Architecture
 
-## Software Setup
+```
+5V/6A Supply
+     │
+     ├───────────────────┬───────────────────┐
+     │                   │                   │
+     ▼                   ▼                   ▼
+  ESP32-C6           NeoPixels         MT3608 Boost
+  (direct)           (direct)          (5V → 12V)
+                        │                    │
+                   1000µF cap                ▼
+                   (smoothing)        MOSFET → nOOds
+```
 
-### Prerequisites
+---
 
-- [ESP-IDF v5.5+](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/get-started/)
-- [Adafruit IO Account](https://io.adafruit.com/) (free)
-- [IFTTT Account](https://ifttt.com/) (for voice control)
+## Software Stack
 
-### Build & Flash
+| Tool                   | What it does                                                   |
+| ---------------------- | -------------------------------------------------------------- |
+| **ESP-IDF v5.5**       | Espressif's official dev framework. Not Arduino.               |
+| **RMT peripheral**     | Hardware peripheral that generates the precise NeoPixel timing |
+| **MQTT (Adafruit IO)** | Cloud broker for receiving voice commands                      |
+| **IFTTT**              | Bridges Google Assistant to Adafruit IO                        |
+| **KiCad**              | For the schematic (living in `cad_mk1/`)                       |
+
+---
+
+## How to Build This Yourself
+
+### 1. Get the hardware
+
+- ESP32-C6 dev board (Waveshare, Seeed, or any)
+- SK6812 RGBW LED strip (60 LEDs or however many you want)
+- 5V power supply (at least 3A, more if you want full brightness)
+- 1000µF capacitor
+- Some wire
+
+### 2. Set up ESP-IDF
 
 ```bash
-# Set up ESP-IDF environment
-source ~/esp/v5.5.1/esp-idf/export.sh
+# Install ESP-IDF (one time)
+mkdir -p ~/esp
+cd ~/esp
+git clone --recursive https://github.com/espressif/esp-idf.git
+cd esp-idf
+./install.sh esp32c6
+source export.sh
+```
 
-# Build
-cd ~/esp/blink
+### 3. Clone and configure
+
+```bash
+git clone <this-repo>
+cd halo
+
+# Set up your credentials
+cp main/credentials.h.template main/credentials.h
+nano main/credentials.h  # Fill in your WiFi and Adafruit IO creds
+```
+
+### 4. Build and flash
+
+```bash
 idf.py build
-
-# Flash and monitor
 idf.py flash monitor
 ```
 
-### Configuration
+### 5. Set up voice control (optional)
 
-#### 1. Set Up Credentials (Required)
+1. Create an [Adafruit IO](https://io.adafruit.com/) account (free)
+2. Create a feed called `halo` (or whatever)
+3. Create [IFTTT](https://ifttt.com/) applets:
+   - **If** Google Assistant "activate rainbow mode"
+   - **Then** Adafruit → Send `rainbow` to your feed
 
-```bash
-# Copy the template
-cp main/credentials.h.template main/credentials.h
+---
 
-# Edit with your values
-nano main/credentials.h
+## Voice Commands
+
+| Say this                                     | It does this                                    |
+| -------------------------------------------- | ----------------------------------------------- |
+| `cycle`                                      | Auto-switches between fusion and wave (default) |
+| `fusion`                                     | White-to-purple gradient                        |
+| `wave`                                       | Blue pulse from center                          |
+| `meteor`                                     | Rotating spinner                                |
+| `rainbow`                                    | Color wheel                                     |
+| `breathing`                                  | Pulsing                                         |
+| `solid`                                      | Static color                                    |
+| `off` / `on`                                 | Self-explanatory                                |
+| `slow` / `medium` / `fast`                   | Animation speed                                 |
+| `red` / `blue` / `purple` / `white` / `warm` | Named colors                                    |
+| `color:FF00FF`                               | Hex color (RRGGBB format)                       |
+
+---
+
+## Startup Sequence
+
+When you power on, this happens:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  ONBOARD LED                │  LED STRIP                       │
+├─────────────────────────────┼──────────────────────────────────┤
+│  Solid white (1 sec)        │  (not initialized yet)           │
+│  Fade to black              │                                  │
+│  Breathing light blue       │  Red pixel scan (hardware test)  │
+│  ░░░▓▓▓███▓▓▓░░░            │  ●○○○○○○○○ → ○●○○○○○○○ → ...     │
+│                             │                                  │
+│  (WiFi connecting...)       │  (visual confirmation LEDs work) │
+├─────────────────────────────┼──────────────────────────────────┤
+│  Solid blue = connected!    │  Clears, starts normal animation │
+│  Blinking red = failed :(   │                                  │
+└─────────────────────────────┴──────────────────────────────────┘
 ```
 
-Fill in your credentials:
-
-```c
-#define WIFI_SSID      "YourWiFiName"
-#define WIFI_PASSWORD  "YourWiFiPassword"
-
-#define ADAFRUIT_IO_USERNAME    "your_username"
-#define ADAFRUIT_IO_KEY         "aio_xxxx..."
-#define ADAFRUIT_IO_FEED        "your_feed_name"
-```
-
-> ⚠️ `credentials.h` is gitignored - your secrets never get committed!
-
-#### 2. LED Configuration (Optional)
-
-Edit `main/blink_example_main.c`:
-
-```c
-#define RGBW_LED_COUNT 60        // Number of NeoPixels
-#define MASTER_BRIGHTNESS 0.50f  // 0.0 to 1.0
-```
-
-## Voice Commands (IFTTT Setup)
-
-1. Create an [IFTTT](https://ifttt.com/) account
-2. Create applets with:
-   - **IF**: Google Assistant → Activate scene → "party mode"
-   - **THEN**: Adafruit → Send data to feed → `rainbow`
-
-### Supported Commands
-
-| Command                                                | Action                           |
-| ------------------------------------------------------ | -------------------------------- |
-| `meteor`                                               | Meteor spinner animation         |
-| `rainbow`                                              | Rainbow cycle animation          |
-| `breathing`                                            | Breathing/pulsing effect         |
-| `solid`                                                | Solid color (current color)      |
-| `off`                                                  | Turn off all LEDs                |
-| `on`                                                   | Turn on (meteor mode)            |
-| `slow` / `medium` / `fast`                             | Animation speed                  |
-| `red` / `green` / `blue` / `purple` / `white` / `warm` | Named colors                     |
-| `color:RRGGBB`                                         | Hex color (e.g., `color:FF00FF`) |
+---
 
 ## Project Structure
 
 ```
-blink/
+halo/
 ├── main/
-│   ├── blink_example_main.c   # Main application code
-│   ├── credentials.h          # Your credentials (gitignored!)
-│   ├── credentials.h.template # Template for credentials
-│   ├── CMakeLists.txt         # Component build config
-│   ├── idf_component.yml      # Component dependencies
-│   └── Kconfig.projbuild      # Menu configuration
-├── schematics/
-│   └── led_controller.kicad_sch  # KiCad schematic
-├── .gitignore                 # Git ignore rules
-├── CMakeLists.txt             # Project build config
-├── sdkconfig.defaults         # Default build settings
-└── README.md                  # This file
+│   ├── halo.c                 # All the code lives here
+│   ├── credentials.h          # Your secrets (gitignored)
+│   └── credentials.h.template # Copy this to get started
+├── cad_mk1/
+│   └── cad_mk1.kicad_sch      # KiCad schematic
+├── build/                      # Compiled stuff (gitignored)
+└── README.md                   # You are here
 ```
 
-## Architecture
+---
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              ESP32-C6                                        │
-│                                                                              │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │   WiFi      │  │    MQTT      │  │  Animation   │  │   LED Drivers    │  │
-│  │  Station    │─▶│   Client     │─▶│   Engine     │─▶│  (RMT, I2C, PWM) │  │
-│  │             │  │ (Adafruit IO)│  │              │  │                  │  │
-│  └─────────────┘  └──────────────┘  └──────────────┘  └────────┬─────────┘  │
-│                                                                 │            │
-└─────────────────────────────────────────────────────────────────┼────────────┘
-                                                                  │
-                    ┌─────────────────────────────────────────────┼────────────┐
-                    │                                             ▼            │
-                    │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
-                    │  │  NeoPixels   │  │  Charlieplex │  │    nOOds     │   │
-                    │  │  (60× RGBW)  │  │   Matrix     │  │  (12V PWM)   │   │
-                    │  │   GPIO4      │  │   I2C        │  │   GPIO5      │   │
-                    │  └──────────────┘  └──────────────┘  └──────────────┘   │
-                    │                      LED OUTPUTS                         │
-                    └──────────────────────────────────────────────────────────┘
+## Current Settings
+
+```c
+#define RGBW_LED_COUNT     15     // Pixels in the ring
+#define MASTER_BRIGHTNESS  0.25f  // 25% brightness (easy on the eyes)
 ```
 
-## Power Requirements
+---
 
-| Device               | Voltage | Max Current | Max Power |
-| -------------------- | ------- | ----------- | --------- |
-| 60× NeoPixels (RGBW) | 5V      | 4.8A        | 24W       |
-| Charlieplex Matrix   | 5V      | 0.5A        | 2.5W      |
-| ESP32-C6             | 5V      | 0.3A        | 1.5W      |
-| nOOds 600mm          | 12V     | 0.25A       | 3W        |
-| **Total**            |         |             | **~32W**  |
+## Future Stuff
 
-**Recommended:** 12V 5A (60W) power supply with 5V 6A buck converter.
-
-## Status LEDs
-
-The onboard RGB LED indicates system status:
-
-| Color      | Pattern   | Meaning                     |
-| ---------- | --------- | --------------------------- |
-| White      | Solid 1s  | Boot started                |
-| Light Blue | Breathing | Connecting to WiFi          |
-| Blue       | Solid     | WiFi connected, MQTT active |
-| Red        | Blinking  | WiFi connection failed      |
-
-## Future Plans
-
-- [ ] Matter integration for native Google/Apple Home support
-- [ ] Web UI for configuration
-- [ ] More animation patterns
+- [ ] Matter support (native Google/Apple Home, no IFTTT needed)
+- [ ] Charlieplex matrix integration
+- [ ] nOOds PWM control
 - [ ] Audio-reactive mode
-- [ ] Home Assistant integration
+- [ ] Web config UI
+- [ ] Home Assistant
+
+---
 
 ## License
 
-This project is open source. Feel free to use, modify, and distribute.
-
-## Acknowledgments
-
-- Built with [ESP-IDF](https://github.com/espressif/esp-idf)
-- Uses [Adafruit IO](https://io.adafruit.com/) for MQTT
-- NeoPixel control via [esp-idf-led-strip](https://components.espressif.com/components/espressif/led_strip)
+Do whatever you want with this. It's just a desk lamp.
