@@ -233,6 +233,7 @@ typedef enum {
     ANIM_TETRIS,        /* Random colored pixels stacking */
     ANIM_STARS,         /* Twinkling stars effect */
     ANIM_METEOR,        /* Meteor spinner */
+    ANIM_METEOR_SHOWER, /* Multiple meteors with rainbow trails */
     ANIM_RAINBOW,       /* Rainbow cycle */
     ANIM_BREATHING,     /* Breathing/pulsing effect */
     ANIM_SOLID,         /* Solid color (no animation) */
@@ -539,6 +540,21 @@ static void buzzer_stop(void)
     ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
 }
 
+/* Set buzzer frequency without blocking (for smooth sweeps) */
+static void buzzer_set_freq(uint16_t frequency_hz)
+{
+    if (!buzzer_initialized) return;
+    
+    if (frequency_hz == 0) {
+        ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 0);
+        ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+    } else {
+        ledc_set_freq(BUZZER_LEDC_MODE, BUZZER_LEDC_TIMER, frequency_hz);
+        ledc_set_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL, 512);  /* 50% duty */
+        ledc_update_duty(BUZZER_LEDC_MODE, BUZZER_LEDC_CHANNEL);
+    }
+}
+
 /* Play a melody (array of notes) */
 static void buzzer_play_melody(const melody_note_t *melody, size_t length)
 {
@@ -843,14 +859,56 @@ static void buzzer_play_random_song(void)
    WIFI CONNECTION
    ============================================================================ */
 
+/* WiFi disconnect reason codes (for debugging) */
+static const char* wifi_disconnect_reason_str(uint8_t reason)
+{
+    switch (reason) {
+        case 1:  return "UNSPECIFIED";
+        case 2:  return "AUTH_EXPIRE";
+        case 3:  return "AUTH_LEAVE";
+        case 4:  return "ASSOC_EXPIRE";
+        case 5:  return "ASSOC_TOOMANY";
+        case 6:  return "NOT_AUTHED";
+        case 7:  return "NOT_ASSOCED";
+        case 8:  return "ASSOC_LEAVE";
+        case 9:  return "ASSOC_NOT_AUTHED";
+        case 10: return "DISASSOC_PWRCAP_BAD";
+        case 11: return "DISASSOC_SUPCHAN_BAD";
+        case 12: return "IE_INVALID";
+        case 13: return "MIC_FAILURE";
+        case 14: return "4WAY_HANDSHAKE_TIMEOUT";  /* Common: wrong password */
+        case 15: return "GROUP_KEY_UPDATE_TIMEOUT";
+        case 16: return "IE_IN_4WAY_DIFFERS";
+        case 17: return "GROUP_CIPHER_INVALID";
+        case 18: return "PAIRWISE_CIPHER_INVALID";
+        case 19: return "AKMP_INVALID";
+        case 20: return "UNSUPP_RSN_IE_VERSION";
+        case 21: return "INVALID_RSN_IE_CAP";
+        case 22: return "802_1X_AUTH_FAILED";
+        case 23: return "CIPHER_SUITE_REJECTED";
+        case 200: return "BEACON_TIMEOUT";  /* Common: out of range */
+        case 201: return "NO_AP_FOUND";     /* Common: SSID not found */
+        case 202: return "AUTH_FAIL";       /* Common: wrong password */
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default: return "UNKNOWN";
+    }
+}
+
 /* WiFi event handler */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG_WIFI, "WiFi started, connecting to %s...", WIFI_SSID);
-        esp_wifi_connect();
+        /* Note: Connection is now started manually after scan completes */
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t* disconnected = (wifi_event_sta_disconnected_t*) event_data;
+        uint8_t reason = disconnected->reason;
+        
+        ESP_LOGW(TAG_WIFI, "Disconnected! Reason: %d (%s)", reason, wifi_disconnect_reason_str(reason));
+        
         if (wifi_retry_count < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             wifi_retry_count++;
@@ -866,6 +924,81 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         wifi_connected = true;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
+}
+
+/* Scan for available WiFi networks (for debugging) */
+static void wifi_scan_networks(void)
+{
+    ESP_LOGI(TAG_WIFI, "");
+    ESP_LOGI(TAG_WIFI, "╔══════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG_WIFI, "║  📡 SCANNING FOR WIFI NETWORKS...                        ║");
+    ESP_LOGI(TAG_WIFI, "╚══════════════════════════════════════════════════════════╝");
+    
+    /* Start scan */
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    
+    esp_err_t ret = esp_wifi_scan_start(&scan_config, true);  /* Blocking scan */
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_WIFI, "Scan failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    /* Get results */
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    
+    if (ap_count == 0) {
+        ESP_LOGW(TAG_WIFI, "  ❌ NO NETWORKS FOUND! Check antenna/location.");
+        return;
+    }
+    
+    ESP_LOGI(TAG_WIFI, "  Found %d networks:", ap_count);
+    
+    wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
+    if (ap_list == NULL) {
+        ESP_LOGE(TAG_WIFI, "  Failed to allocate memory for scan results");
+        return;
+    }
+    
+    esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+    
+    bool found_target = false;
+    for (int i = 0; i < ap_count; i++) {
+        const char *match = "";
+        if (strcmp((char*)ap_list[i].ssid, WIFI_SSID) == 0) {
+            match = " ✅ TARGET";
+            found_target = true;
+        }
+        ESP_LOGI(TAG_WIFI, "    %2d. %-32s  CH:%2d  RSSI:%4d dBm%s",
+                 i + 1,
+                 ap_list[i].ssid,
+                 ap_list[i].primary,
+                 ap_list[i].rssi,
+                 match);
+    }
+    
+    if (!found_target) {
+        ESP_LOGW(TAG_WIFI, "");
+        ESP_LOGW(TAG_WIFI, "  ⚠️  TARGET NETWORK '%s' NOT FOUND IN SCAN!", WIFI_SSID);
+        ESP_LOGW(TAG_WIFI, "  Possible causes:");
+        ESP_LOGW(TAG_WIFI, "    - SSID typo (check exact spelling/case)");
+        ESP_LOGW(TAG_WIFI, "    - Router's 2.4GHz is off (ESP32 can't see 5GHz)");
+        ESP_LOGW(TAG_WIFI, "    - Too far from router");
+        ESP_LOGW(TAG_WIFI, "    - Hidden SSID");
+    } else {
+        ESP_LOGI(TAG_WIFI, "  ✅ Target network '%s' found!", WIFI_SSID);
+    }
+    
+    free(ap_list);
+    ESP_LOGI(TAG_WIFI, "");
 }
 
 /* Initialize and connect to WiFi (non-blocking, returns immediately) */
@@ -901,13 +1034,23 @@ static void wifi_init_start(void)
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            /* Use OPEN threshold to accept any security mode (WPA, WPA2, WPA3) */
+            .threshold.authmode = WIFI_AUTH_OPEN,
+            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,  /* Support WPA3 if router uses it */
         },
     };
     
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    
+    /* Do a quick scan first to see what networks are available (helps debug) */
+    vTaskDelay(100 / portTICK_PERIOD_MS);  /* Brief delay to let WiFi fully start */
+    wifi_scan_networks();
+    
+    /* Now start the actual connection */
+    ESP_LOGI(TAG_WIFI, "Starting connection to %s...", WIFI_SSID);
+    esp_wifi_connect();
     
     ESP_LOGI(TAG_WIFI, "WiFi initialization complete, connecting...");
 }
@@ -980,6 +1123,10 @@ static void handle_mqtt_command(const char *data, int data_len)
     else if (strcmp(command, "meteor") == 0) {
         current_animation = ANIM_METEOR;
         ESP_LOGI(TAG_MQTT, "Animation: METEOR SPINNER");
+    }
+    else if (strcmp(command, "shower") == 0 || strcmp(command, "meteor shower") == 0) {
+        current_animation = ANIM_METEOR_SHOWER;
+        ESP_LOGI(TAG_MQTT, "Animation: METEOR SHOWER (rainbow trails)");
     }
     else if (strcmp(command, "rainbow") == 0) {
         current_animation = ANIM_RAINBOW;
@@ -1108,10 +1255,38 @@ static void handle_mqtt_command(const char *data, int data_len)
         }
     }
     else if (strcmp(command, "zigbee:status") == 0) {
-        ESP_LOGI(TAG_MQTT, "Zigbee: Network %s, %d devices paired",
-                 zigbee_is_network_ready() ? "READY" : "NOT READY",
-                 zigbee_get_device_count());
-        zigbee_devices_print_all();
+        /* Print detailed network status and device list */
+        zigbee_print_network_status();
+    }
+    else if (strcmp(command, "zigbee:scan") == 0) {
+        /* Start periodic scanning every 10 seconds */
+        ESP_LOGI(TAG_MQTT, "Zigbee: Starting device scan (10s interval)");
+        zigbee_start_device_scan(10);
+    }
+    else if (strcmp(command, "zigbee:scan:stop") == 0) {
+        /* Stop periodic scanning */
+        ESP_LOGI(TAG_MQTT, "Zigbee: Stopping device scan");
+        zigbee_stop_device_scan();
+    }
+    else if (strncmp(command, "zigbee:scan:", 12) == 0) {
+        /* zigbee:scan:XX where XX is interval in seconds */
+        int interval = atoi(command + 12);
+        if (interval > 0 && interval <= 3600) {
+            ESP_LOGI(TAG_MQTT, "Zigbee: Starting device scan (%ds interval)", interval);
+            zigbee_start_device_scan((uint16_t)interval);
+        } else {
+            ESP_LOGW(TAG_MQTT, "Invalid scan interval: %d (use 1-3600)", interval);
+        }
+    }
+    else if (strcmp(command, "zigbee:neighbors") == 0) {
+        /* Scan neighbors in radio range */
+        zigbee_scan_neighbors();
+    }
+    else if (strcmp(command, "zigbee:finder") == 0) {
+        /* Restart finder mode to search for new devices */
+        ESP_LOGI(TAG_MQTT, "Zigbee: Restarting finder mode (60s search)...");
+        zigbee_start_device_scan(ZIGBEE_FINDER_SCAN_INTERVAL);
+        zigbee_permit_join(ZIGBEE_FINDER_TIMEOUT_SEC);
     }
     else {
         ESP_LOGW(TAG_MQTT, "Unknown command: '%s'", command);
@@ -1529,6 +1704,162 @@ static void draw_meteor_spinner(float head_pos)
         
         set_pixel_rgbw(i, pr, pg, pb, pw);
     }
+    refresh_strip();
+}
+
+/* ============================================================================
+   METEOR SHOWER ANIMATION
+   ============================================================================
+   Multiple meteors (4-5) moving in same direction with rainbow comet trails.
+   Each meteor has varying brightness which determines tail length.
+   ============================================================================ */
+
+#define METEOR_SHOWER_COUNT 5   /* Number of simultaneous meteors */
+#define METEOR_SHOWER_MIN_TAIL 3
+#define METEOR_SHOWER_MAX_TAIL 15
+
+static void draw_meteor_shower(bool reset)
+{
+    if (rgbw_strip == NULL) return;
+    
+    /* Static state for meteors */
+    static struct {
+        float position;        /* Current position (floating point for smooth movement) */
+        float speed;           /* Movement speed (0.3 - 1.0) */
+        float brightness;      /* Peak brightness (0.4 - 1.0), determines tail length */
+        float hue;             /* Rainbow hue for this meteor (0-360) */
+        int tail_length;       /* Tail length in pixels */
+        bool active;           /* Is this meteor active */
+    } meteors[METEOR_SHOWER_COUNT];
+    
+    static bool initialized = false;
+    static uint32_t rand_seed = 98765;
+    
+    #define SHOWER_RAND() (rand_seed = rand_seed * 1103515245 + 12345, (rand_seed >> 16) & 0xFFFF)
+    
+    /* Initialize or reset meteors */
+    if (reset || !initialized) {
+        for (int i = 0; i < METEOR_SHOWER_COUNT; i++) {
+            /* Spread meteors evenly across the strip initially */
+            meteors[i].position = (float)(RGBW_LED_COUNT / METEOR_SHOWER_COUNT) * i;
+            meteors[i].speed = 0.3f + (float)(SHOWER_RAND() % 70) / 100.0f;  /* 0.3 - 1.0 */
+            meteors[i].brightness = 0.4f + (float)(SHOWER_RAND() % 60) / 100.0f;  /* 0.4 - 1.0 */
+            meteors[i].hue = (float)(SHOWER_RAND() % 360);  /* Random starting hue */
+            /* Tail length based on brightness */
+            meteors[i].tail_length = METEOR_SHOWER_MIN_TAIL + 
+                (int)((meteors[i].brightness - 0.4f) / 0.6f * (METEOR_SHOWER_MAX_TAIL - METEOR_SHOWER_MIN_TAIL));
+            meteors[i].active = true;
+        }
+        initialized = true;
+    }
+    
+    /* Clear strip first */
+    for (int i = 0; i < RGBW_LED_COUNT; i++) {
+        set_pixel_rgbw(i, 0, 0, 0, 0);
+    }
+    
+    /* Pixel buffer to blend multiple meteors */
+    static float pixel_r[RGBW_LED_COUNT];
+    static float pixel_g[RGBW_LED_COUNT];
+    static float pixel_b[RGBW_LED_COUNT];
+    
+    for (int i = 0; i < RGBW_LED_COUNT; i++) {
+        pixel_r[i] = 0;
+        pixel_g[i] = 0;
+        pixel_b[i] = 0;
+    }
+    
+    /* Draw each meteor */
+    for (int m = 0; m < METEOR_SHOWER_COUNT; m++) {
+        if (!meteors[m].active) continue;
+        
+        int head_pos = (int)meteors[m].position % RGBW_LED_COUNT;
+        float brightness = meteors[m].brightness;
+        int tail_len = meteors[m].tail_length;
+        float base_hue = meteors[m].hue;
+        
+        /* Draw the meteor head and tail */
+        for (int t = 0; t <= tail_len; t++) {
+            int pixel_idx = (head_pos - t + RGBW_LED_COUNT) % RGBW_LED_COUNT;
+            
+            /* Calculate brightness falloff (exponential decay for tail) */
+            float tail_factor;
+            if (t == 0) {
+                tail_factor = 1.0f;  /* Head is brightest */
+            } else {
+                /* Exponential decay for nice comet trail */
+                tail_factor = powf(0.7f, (float)t);
+            }
+            
+            float pixel_brightness = brightness * tail_factor;
+            
+            /* Rainbow gradient along the tail - hue shifts through the trail */
+            float hue = fmodf(base_hue + (float)t * 15.0f, 360.0f);  /* Shift hue along tail */
+            
+            /* HSV to RGB conversion */
+            float h = hue / 60.0f;
+            int hi = (int)h % 6;
+            float f = h - (int)h;
+            float q = 1.0f - f;
+            
+            float r, g, b;
+            switch (hi) {
+                case 0: r = 1; g = f; b = 0; break;
+                case 1: r = q; g = 1; b = 0; break;
+                case 2: r = 0; g = 1; b = f; break;
+                case 3: r = 0; g = q; b = 1; break;
+                case 4: r = f; g = 0; b = 1; break;
+                default: r = 1; g = 0; b = q; break;
+            }
+            
+            /* Add to pixel buffer (additive blending) */
+            pixel_r[pixel_idx] += r * pixel_brightness;
+            pixel_g[pixel_idx] += g * pixel_brightness;
+            pixel_b[pixel_idx] += b * pixel_brightness;
+        }
+        
+        /* Move meteor forward */
+        meteors[m].position += meteors[m].speed * animation_speed * 3.0f;
+        
+        /* Wrap around */
+        if (meteors[m].position >= RGBW_LED_COUNT) {
+            meteors[m].position -= RGBW_LED_COUNT;
+            
+            /* Randomize properties for next loop */
+            meteors[m].speed = 0.3f + (float)(SHOWER_RAND() % 70) / 100.0f;
+            meteors[m].brightness = 0.4f + (float)(SHOWER_RAND() % 60) / 100.0f;
+            meteors[m].hue = (float)(SHOWER_RAND() % 360);
+            meteors[m].tail_length = METEOR_SHOWER_MIN_TAIL + 
+                (int)((meteors[m].brightness - 0.4f) / 0.6f * (METEOR_SHOWER_MAX_TAIL - METEOR_SHOWER_MIN_TAIL));
+        }
+        
+        /* Slowly shift hue for rainbow effect */
+        meteors[m].hue = fmodf(meteors[m].hue + 0.5f, 360.0f);
+    }
+    
+    /* Apply pixel buffer to LEDs with clamping */
+    for (int i = 0; i < RGBW_LED_COUNT; i++) {
+        float r = pixel_r[i];
+        float g = pixel_g[i];
+        float b = pixel_b[i];
+        
+        /* Clamp to 1.0 */
+        if (r > 1.0f) r = 1.0f;
+        if (g > 1.0f) g = 1.0f;
+        if (b > 1.0f) b = 1.0f;
+        
+        /* Apply gamma correction and master brightness */
+        r = gamma_correct(r);
+        g = gamma_correct(g);
+        b = gamma_correct(b);
+        
+        set_pixel_rgbw(i, 
+            (uint8_t)(r * 255 * MASTER_BRIGHTNESS),
+            (uint8_t)(g * 255 * MASTER_BRIGHTNESS),
+            (uint8_t)(b * 255 * MASTER_BRIGHTNESS),
+            0);
+    }
+    
     refresh_strip();
 }
 
@@ -2498,15 +2829,10 @@ void app_main(void)
     int test_color_phase = 0;          /* 0=Red, 1=Green, 2=Blue, 3=Full white, 4=Complete */
     bool led_test_complete = false;
     
-    /* Buzzer test state - sweep through frequency spectrum */
+    /* Buzzer test state - clean sweep (4s up, 1s down, no hold) */
     bool buzzer_test_complete = false;
-    int buzzer_freq = 200;             /* Start at 200Hz (low tone) */
-    const int buzzer_freq_max = 4000;  /* End at 4000Hz (high tone) */
-    const int buzzer_freq_step = 100;  /* Step by 100Hz each tone */
     int buzzer_frame_count = 0;
-    const int buzzer_frames_per_tone = 3;  /* Hold each frequency for 3 frames (~50ms) */
-    int buzzer_phase = 0;              /* 0=sweep up, 1=hold at max, 2=sweep down */
-    int buzzer_hold_frames = 0;        /* Counter for hold phase */
+    int buzzer_phase = 0;              /* 0=sweep up, 1=sweep down */
 
     ESP_LOGI(TAG, "    Onboard: Breathing light blue while connecting to '%s'", WIFI_SSID);
     ESP_LOGI(TAG, "    Strip:   RGB scan (batches of %d) → 5s full white test", batch_size);
@@ -2653,48 +2979,40 @@ void app_main(void)
             led_test_complete = true;  /* No strip, skip test */
         }
         
-        /* === BUZZER TEST: Frequency sweep up, hold, sweep down === */
+        /* === BUZZER TEST: Clean sweep up then sweep down (no hold) === */
         if (!buzzer_test_complete && buzzer_initialized) {
-            buzzer_frame_count++;
+            /* 
+             * Clean sweep: 4 seconds UP (200Hz → 4000Hz), 1 second DOWN (4000Hz → 200Hz)
+             * Using non-blocking buzzer_set_freq for smooth transitions
+             */
+            const int STARTUP_SWEEP_UP_FRAMES = 4 * 60;    /* 4 seconds at 60 FPS */
+            const int STARTUP_SWEEP_DOWN_FRAMES = 1 * 60;  /* 1 second at 60 FPS */
+            const int STARTUP_MIN_HZ = 200;
+            const int STARTUP_MAX_HZ = 4000;
             
             if (buzzer_phase == 0) {
-                /* Phase 0: Sweep UP (200Hz → 4000Hz) */
-                if (buzzer_frame_count >= buzzer_frames_per_tone) {
-                    buzzer_frame_count = 0;
-                    buzzer_tone(buzzer_freq, 40);
-                    buzzer_freq += buzzer_freq_step;
-                    
-                    if (buzzer_freq >= buzzer_freq_max) {
-                        buzzer_freq = buzzer_freq_max;
-                        buzzer_phase = 1;
-                        buzzer_hold_frames = 0;
-                        ESP_LOGI(TAG, "    Buzzer: Holding at 4000Hz...");
-                    }
-                }
-            } else if (buzzer_phase == 1) {
-                /* Phase 1: HOLD at max frequency for ~1 second */
-                buzzer_tone(buzzer_freq_max, 16);  /* Continuous tone */
-                buzzer_hold_frames++;
+                /* Phase 0: Sweep UP (200Hz → 4000Hz) over 4 seconds */
+                float progress = (float)buzzer_frame_count / (float)STARTUP_SWEEP_UP_FRAMES;
+                int freq = STARTUP_MIN_HZ + (int)(progress * (STARTUP_MAX_HZ - STARTUP_MIN_HZ));
+                buzzer_set_freq(freq);
+                buzzer_frame_count++;
                 
-                if (buzzer_hold_frames >= 60) {  /* ~1 second at 60fps */
-                    buzzer_phase = 2;
+                if (buzzer_frame_count >= STARTUP_SWEEP_UP_FRAMES) {
+                    buzzer_phase = 1;  /* Skip to sweep down (no hold) */
                     buzzer_frame_count = 0;
                     ESP_LOGI(TAG, "    Buzzer: Sweeping down...");
                 }
-            } else if (buzzer_phase == 2) {
-                /* Phase 2: Quick sweep DOWN (4000Hz → 200Hz → silence) */
+            } else if (buzzer_phase == 1) {
+                /* Phase 1: Sweep DOWN (4000Hz → 200Hz) over 1 second (4x faster) */
+                float progress = (float)buzzer_frame_count / (float)STARTUP_SWEEP_DOWN_FRAMES;
+                int freq = STARTUP_MAX_HZ - (int)(progress * (STARTUP_MAX_HZ - STARTUP_MIN_HZ));
+                buzzer_set_freq(freq);
                 buzzer_frame_count++;
-                if (buzzer_frame_count >= 1) {  /* Fast! Every frame */
-                    buzzer_frame_count = 0;
-                    buzzer_freq -= 200;  /* Fast descent (200Hz per frame) */
-                    
-                    if (buzzer_freq <= 0) {
-                        buzzer_stop();
-                        buzzer_test_complete = true;
-                        ESP_LOGI(TAG, "    >>> BUZZER TEST FINISHED");
-                    } else {
-                        buzzer_tone(buzzer_freq, 16);
-                    }
+                
+                if (buzzer_frame_count >= STARTUP_SWEEP_DOWN_FRAMES) {
+                    buzzer_stop();
+                    buzzer_test_complete = true;
+                    ESP_LOGI(TAG, "    >>> BUZZER TEST FINISHED");
                 }
             }
         } else if (!buzzer_initialized) {
@@ -2742,16 +3060,117 @@ void app_main(void)
         esp_err_t zb_err = zigbee_hub_init();
         if (zb_err == ESP_OK) {
             ESP_LOGI(TAG, ">>> Zigbee Hub started successfully!");
+            
+            /* ================================================================
+               ZIGBEE FINDER MODE
+               ================================================================
+               Wait for Zigbee to either:
+               1. Reconnect to previously paired devices, OR
+               2. Complete finder mode (1 minute or until device pairs)
+               
+               During this time:
+               - LED strip: stays at boot state (10% warm white)
+               - Onboard LED: smooth sweeping green
+               - Buzzer: 4s sweep up + 1s sweep down
+               ================================================================ */
+            
+            ESP_LOGI(TAG, ">>> STEP 5: Waiting for Zigbee finder mode...");
+            ESP_LOGI(TAG, "    (Searching for Zigbee devices for up to 60 seconds)");
+            
+            float finder_pulse_phase = 0.0f;
+            int finder_wait_frames = 0;
+            const int finder_max_frames = 60 * 60;  /* 60 seconds at 60 FPS */
+            
+            /* ================================================================
+               BUZZER SWEEP DURING FINDER MODE
+               ================================================================
+               - 4 seconds: Slow sweep up from 200Hz to 4000Hz
+               - 1 second: Fast sweep down from 4000Hz to 200Hz (4x faster)
+               - Then silence
+               Total: 5 seconds of buzzer, then quiet
+               ================================================================ */
+            const int SWEEP_UP_FRAMES = 4 * 60;     /* 4 seconds at 60 FPS = 240 frames */
+            const int SWEEP_DOWN_FRAMES = 1 * 60;   /* 1 second at 60 FPS = 60 frames */
+            const int SWEEP_MIN_HZ = 200;
+            const int SWEEP_MAX_HZ = 4000;
+            int buzzer_frame = 0;
+            bool buzzer_done = false;
+            
+            while (!zigbee_is_finder_complete() && finder_wait_frames < finder_max_frames) {
+                /* LED strip stays at boot state (10% warm white) - no changes needed */
+                
+                /* Onboard LED: Smooth sweeping green during finder mode */
+                finder_pulse_phase += 0.05f;
+                float brightness = (sinf(finder_pulse_phase) + 1.0f) * 0.5f;  /* 0 to 1 */
+                uint8_t green_val = (uint8_t)(brightness * 255.0f);  /* Full brightness sweep */
+                set_onboard_led_rgb(0, green_val, 0);
+                
+                /* Buzzer sweep logic (non-blocking) */
+                if (!buzzer_done && buzzer_initialized) {
+                    if (buzzer_frame < SWEEP_UP_FRAMES) {
+                        /* Sweep UP: 200Hz → 4000Hz over 4 seconds */
+                        float progress = (float)buzzer_frame / (float)SWEEP_UP_FRAMES;
+                        int freq = SWEEP_MIN_HZ + (int)(progress * (SWEEP_MAX_HZ - SWEEP_MIN_HZ));
+                        buzzer_set_freq(freq);  /* Non-blocking frequency update */
+                    } else if (buzzer_frame < SWEEP_UP_FRAMES + SWEEP_DOWN_FRAMES) {
+                        /* Sweep DOWN: 4000Hz → 200Hz over 1 second (4x faster) */
+                        int down_frame = buzzer_frame - SWEEP_UP_FRAMES;
+                        float progress = (float)down_frame / (float)SWEEP_DOWN_FRAMES;
+                        int freq = SWEEP_MAX_HZ - (int)(progress * (SWEEP_MAX_HZ - SWEEP_MIN_HZ));
+                        buzzer_set_freq(freq);  /* Non-blocking frequency update */
+                    } else {
+                        /* Done - stop buzzer */
+                        buzzer_stop();
+                        buzzer_done = true;
+                        ESP_LOGI(TAG, "    Buzzer sweep complete");
+                    }
+                    buzzer_frame++;
+                }
+                
+                finder_wait_frames++;
+                vTaskDelay(16 / portTICK_PERIOD_MS);  /* 60 FPS */
+            }
+            
+            /* Make sure buzzer is off when exiting finder mode */
+            if (buzzer_initialized && !buzzer_done) {
+                buzzer_stop();
+            }
+            
+            /* Finder mode complete - show result */
+            if (zigbee_get_device_count() > 0) {
+                ESP_LOGI(TAG, ">>> Zigbee: %d device(s) found/connected!", zigbee_get_device_count());
+                /* Flash green briefly to indicate success */
+                fade_to_color(0, 255, 0, 300);
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+            } else {
+                ESP_LOGW(TAG, ">>> Zigbee: No devices found. Use 'blinds:pair' to pair later.");
+            }
+            
         } else {
             ESP_LOGE(TAG, ">>> Zigbee Hub failed to start: %s", esp_err_to_name(zb_err));
         }
     } else {
         ESP_LOGE(TAG, ">>> WiFi FAILED! Fading to blinking red...");
+        ESP_LOGI(TAG, ">>> Press BOOT button to enter standby mode");
         buzzer_error();  /* Error beeps! */
         fade_to_color(255, 0, 0, 500);  /* Fade to 100% red */
         
-        /* Blink red on/off forever in a background-like manner */
+        /* Blink red on/off - but check for power button to allow standby */
         while (1) {
+            /* Check for power button press */
+            if (is_power_button_pressed()) {
+                vTaskDelay(50 / portTICK_PERIOD_MS);  /* Debounce */
+                if (is_power_button_pressed()) {
+                    ESP_LOGI(TAG, "Power button pressed, entering standby...");
+                    buzzer_chime_down();  /* Shutdown melody */
+                    while (is_power_button_pressed()) {
+                        vTaskDelay(50 / portTICK_PERIOD_MS);
+                    }
+                    vTaskDelay(100 / portTICK_PERIOD_MS);  /* Debounce release */
+                    enter_standby_mode();  /* Enter standby */
+                }
+            }
+            
             fade_to_color(0, 0, 0, 400);
             vTaskDelay(200 / portTICK_PERIOD_MS);
             fade_to_color(255, 0, 0, 400);
@@ -2777,7 +3196,20 @@ void app_main(void)
     float wave_phase = 0.0f;         /* For wave animation */
     float fusion_phase = 0.0f;       /* For fusion animation */
     float onboard_rainbow = 0.0f;    /* For slow rainbow on onboard LED */
-    const int animation_delay_ms = 16;  /* Frame time in ms (60 FPS) */
+    
+    /* Global frame rate (default 60 FPS) */
+    const int global_delay_ms = 16;  /* 16ms = ~60 FPS */
+    
+    /* Local FPS overrides per animation (0 = use global) */
+    #define ANIM_FPS_GLOBAL     0     /* Use global 60 FPS */
+    #define ANIM_FPS_45         22    /* 22ms = ~45 FPS */
+    #define ANIM_FPS_30         33    /* 33ms = ~30 FPS */
+    
+    /* Get frame delay for current animation (local override or global default) */
+    #define GET_ANIM_DELAY(mode) ( \
+        (mode) == ANIM_STARS ? ANIM_FPS_45 : \
+        global_delay_ms \
+    )
     
     /* Cycle mode state (switches between fusion, wave, tetris every 20 seconds) */
     int cycle_timer_ms = 0;
@@ -2792,7 +3224,7 @@ void app_main(void)
     ESP_LOGI(TAG, "    - MQTT: Listening for voice commands on '%s'", MQTT_TOPIC);
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "    Voice commands available:");
-    ESP_LOGI(TAG, "      cycle, fusion, wave, tetris, stars, meteor, rainbow, breathing, solid, off, on");
+    ESP_LOGI(TAG, "      cycle, fusion, wave, tetris, stars, meteor, shower, rainbow, breathing, solid, off, on");
     ESP_LOGI(TAG, "      slow, medium, fast");
     ESP_LOGI(TAG, "      red, green, blue, purple, white, warm");
     ESP_LOGI(TAG, "      color:RRGGBB (hex)");
@@ -2850,7 +3282,7 @@ void app_main(void)
                 }
             }
             
-            vTaskDelay(animation_delay_ms / portTICK_PERIOD_MS);
+            vTaskDelay(global_delay_ms / portTICK_PERIOD_MS);
             continue;  /* Skip normal animation this frame */
         }
         
@@ -2858,10 +3290,13 @@ void app_main(void)
         animation_mode_t mode = current_animation;
         float speed = animation_speed;
         
+        /* Get frame delay for current animation (may have local FPS override) */
+        int frame_delay = GET_ANIM_DELAY(mode);
+        
         switch (mode) {
             case ANIM_CYCLE:
                 /* Auto-cycle between fusion, wave, tetris, stars every 20 seconds */
-                cycle_timer_ms += animation_delay_ms;
+                cycle_timer_ms += frame_delay;
                 if (cycle_timer_ms >= cycle_interval_ms) {
                     cycle_timer_ms = 0;
                     cycle_anim_index = (cycle_anim_index + 1) % 4;
@@ -2923,6 +3358,14 @@ void app_main(void)
                 if (head_position >= RGBW_LED_COUNT) {
                     head_position -= RGBW_LED_COUNT;
                     increment_rotation_count();
+                }
+                break;
+            
+            case ANIM_METEOR_SHOWER:
+                {
+                    static bool meteor_shower_first_frame = true;
+                    draw_meteor_shower(meteor_shower_first_frame);
+                    meteor_shower_first_frame = false;
                 }
                 break;
                 
@@ -3005,7 +3448,7 @@ void app_main(void)
             }
         }
         
-        /* Wait before next frame */
-        vTaskDelay(animation_delay_ms / portTICK_PERIOD_MS);
+        /* Wait before next frame (uses animation-specific FPS if set) */
+        vTaskDelay(frame_delay / portTICK_PERIOD_MS);
     }
 }

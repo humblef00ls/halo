@@ -20,6 +20,21 @@
 #define ZIGBEE_HUB_ENDPOINT         1       /* Hub's own endpoint */
 #define ZIGBEE_PRIMARY_CHANNEL      13      /* Zigbee channel (11-26, 13 is common) */
 #define ZIGBEE_PAIRING_TIMEOUT      180     /* Default pairing timeout in seconds */
+#define ZIGBEE_FINDER_TIMEOUT_SEC   60      /* Finder mode timeout in seconds */
+#define ZIGBEE_FINDER_SCAN_INTERVAL 5       /* Scan interval during finder mode (seconds) */
+
+/* ============================================================================
+   ZIGBEE BOOT STATES
+   ============================================================================ */
+
+typedef enum {
+    ZIGBEE_STATE_INITIALIZING = 0,  /* Stack initializing */
+    ZIGBEE_STATE_FORMING_NETWORK,   /* Forming the network */
+    ZIGBEE_STATE_FINDER_MODE,       /* Actively searching for devices to pair */
+    ZIGBEE_STATE_RECONNECTING,      /* Trying to reconnect to known devices */
+    ZIGBEE_STATE_READY,             /* Normal operation - devices paired */
+    ZIGBEE_STATE_FAILED,            /* Initialization failed */
+} zigbee_state_t;
 
 /* ============================================================================
    DEVICE TYPES
@@ -65,6 +80,32 @@ esp_err_t zigbee_hub_init(void);
  * @return true if network is formed, false otherwise
  */
 bool zigbee_is_network_ready(void);
+
+/**
+ * @brief Get current Zigbee boot state
+ * 
+ * @return Current state of the Zigbee subsystem
+ */
+zigbee_state_t zigbee_get_state(void);
+
+/**
+ * @brief Check if Zigbee finder mode is complete
+ * 
+ * Finder mode completes when:
+ * - A device is successfully paired, OR
+ * - The finder timeout (60s) expires
+ * 
+ * @return true if finder mode is complete (or was skipped because devices exist)
+ */
+bool zigbee_is_finder_complete(void);
+
+/**
+ * @brief Get the state as a human-readable string
+ * 
+ * @param state The state to convert
+ * @return String representation of the state
+ */
+const char* zigbee_state_to_string(zigbee_state_t state);
 
 /* ============================================================================
    DEVICE PAIRING
@@ -135,6 +176,40 @@ esp_err_t zigbee_blind_stop(uint16_t device_addr);
  * @return ESP_OK on success
  */
 esp_err_t zigbee_blind_set_position(uint16_t device_addr, uint8_t percent);
+
+/* ============================================================================
+   DEVICE SCANNING & MONITORING
+   ============================================================================ */
+
+/**
+ * @brief Start periodic device scanning/listing
+ * 
+ * Logs all known devices every interval_sec seconds.
+ * Also keeps network open for new devices to join.
+ * 
+ * @param interval_sec Interval between scans (0 to stop scanning)
+ */
+void zigbee_start_device_scan(uint16_t interval_sec);
+
+/**
+ * @brief Stop periodic device scanning
+ */
+void zigbee_stop_device_scan(void);
+
+/**
+ * @brief Print current network status and all known devices
+ * 
+ * Logs to console: network info, channel, PAN ID, and list of all devices
+ */
+void zigbee_print_network_status(void);
+
+/**
+ * @brief Scan for devices in the neighbor table
+ * 
+ * Iterates through the Zigbee stack's neighbor table and logs all entries.
+ * This shows devices that are currently in radio range.
+ */
+void zigbee_scan_neighbors(void);
 
 #endif /* ZIGBEE_HUB_H */
 

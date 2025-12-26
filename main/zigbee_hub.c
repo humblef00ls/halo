@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_coexist.h"
 
@@ -50,6 +51,15 @@ static const char *TAG = "zigbee_hub";
 
 static bool s_network_ready = false;
 static TaskHandle_t s_zigbee_task_handle = NULL;
+static esp_timer_handle_t s_scan_timer = NULL;
+static uint16_t s_scan_interval_sec = 0;
+
+/* Finder mode state */
+static zigbee_state_t s_zigbee_state = ZIGBEE_STATE_INITIALIZING;
+static esp_timer_handle_t s_finder_timer = NULL;
+static int s_finder_elapsed_sec = 0;
+static bool s_finder_complete = false;
+static bool s_device_paired_during_finder = false;
 
 /* ============================================================================
    FORWARD DECLARATIONS
@@ -57,6 +67,180 @@ static TaskHandle_t s_zigbee_task_handle = NULL;
 
 static void esp_zb_task(void *pvParameters);
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
+static void finder_mode_timer_callback(void *arg);
+static void start_finder_mode(void);
+static void stop_finder_mode(bool paired);
+
+/* ============================================================================
+   STATE HELPERS
+   ============================================================================ */
+
+const char* zigbee_state_to_string(zigbee_state_t state)
+{
+    switch (state) {
+        case ZIGBEE_STATE_INITIALIZING:     return "INITIALIZING";
+        case ZIGBEE_STATE_FORMING_NETWORK:  return "FORMING_NETWORK";
+        case ZIGBEE_STATE_FINDER_MODE:      return "FINDER_MODE";
+        case ZIGBEE_STATE_RECONNECTING:     return "RECONNECTING";
+        case ZIGBEE_STATE_READY:            return "READY";
+        case ZIGBEE_STATE_FAILED:           return "FAILED";
+        default:                            return "UNKNOWN";
+    }
+}
+
+zigbee_state_t zigbee_get_state(void)
+{
+    return s_zigbee_state;
+}
+
+bool zigbee_is_finder_complete(void)
+{
+    return s_finder_complete;
+}
+
+/* ============================================================================
+   FINDER MODE - Actively search for new devices
+   ============================================================================ */
+
+static void finder_mode_timer_callback(void *arg)
+{
+    s_finder_elapsed_sec += ZIGBEE_FINDER_SCAN_INTERVAL;
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  🔍 ZIGBEE FINDER MODE - Searching for devices...        ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "  Elapsed: %d/%d seconds", s_finder_elapsed_sec, ZIGBEE_FINDER_TIMEOUT_SEC);
+    
+    /* Print network status */
+    if (s_network_ready) {
+        ESP_LOGI(TAG, "  Network: READY on channel %d, PAN: 0x%04hx",
+                 esp_zb_get_current_channel(), esp_zb_get_pan_id());
+    }
+    
+    /* Check if we've paired a device */
+    int device_count = zigbee_devices_get_count();
+    if (device_count > 0) {
+        ESP_LOGI(TAG, "  ✅ DEVICE FOUND! %d device(s) paired!", device_count);
+        stop_finder_mode(true);
+        return;
+    }
+    
+    /* Scan neighbors */
+    ESP_LOGI(TAG, "  Scanning for nearby Zigbee devices...");
+    
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_nwk_neighbor_info_t neighbor_info;
+    esp_zb_nwk_info_iterator_t iterator = 0;  /* Start from beginning */
+    bool found_any = false;
+    esp_err_t ret = esp_zb_nwk_get_next_neighbor(&iterator, &neighbor_info);
+    
+    while (ret == ESP_OK) {
+        found_any = true;
+        ESP_LOGI(TAG, "    📡 Nearby: addr=0x%04x, LQI=%d, depth=%d",
+                 neighbor_info.short_addr,
+                 neighbor_info.lqi,
+                 neighbor_info.depth);
+        ret = esp_zb_nwk_get_next_neighbor(&iterator, &neighbor_info);
+    }
+    esp_zb_lock_release();
+    
+    if (!found_any) {
+        ESP_LOGI(TAG, "    (no devices in range yet - put your blind in pairing mode!)");
+    }
+    
+    /* Keep network open for joining */
+    esp_zb_bdb_open_network(ZIGBEE_FINDER_SCAN_INTERVAL + 2);
+    ESP_LOGI(TAG, "  Network OPEN for pairing - waiting for devices to join...");
+    ESP_LOGI(TAG, "");
+    
+    /* Check timeout */
+    if (s_finder_elapsed_sec >= ZIGBEE_FINDER_TIMEOUT_SEC) {
+        ESP_LOGW(TAG, "  ⏱️ Finder mode timeout (%d seconds) - no devices paired",
+                 ZIGBEE_FINDER_TIMEOUT_SEC);
+        stop_finder_mode(false);
+    }
+}
+
+static void start_finder_mode(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  🔍 STARTING ZIGBEE FINDER MODE                          ║");
+    ESP_LOGI(TAG, "║  Looking for Zigbee devices to pair...                   ║");
+    ESP_LOGI(TAG, "║  Will scan every %d seconds for up to %d seconds          ║",
+             ZIGBEE_FINDER_SCAN_INTERVAL, ZIGBEE_FINDER_TIMEOUT_SEC);
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
+    
+    s_zigbee_state = ZIGBEE_STATE_FINDER_MODE;
+    s_finder_elapsed_sec = 0;
+    s_device_paired_during_finder = false;
+    s_finder_complete = false;
+    
+    /* Create finder timer */
+    esp_timer_create_args_t timer_args = {
+        .callback = finder_mode_timer_callback,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "zb_finder_timer",
+    };
+    
+    esp_err_t ret = esp_timer_create(&timer_args, &s_finder_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create finder timer: %s", esp_err_to_name(ret));
+        s_finder_complete = true;
+        return;
+    }
+    
+    /* Open network for devices to join */
+    esp_zb_bdb_open_network(ZIGBEE_FINDER_TIMEOUT_SEC + 10);
+    
+    /* Start periodic timer (every ZIGBEE_FINDER_SCAN_INTERVAL seconds) */
+    ret = esp_timer_start_periodic(s_finder_timer, 
+                                   (uint64_t)ZIGBEE_FINDER_SCAN_INTERVAL * 1000000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start finder timer: %s", esp_err_to_name(ret));
+        esp_timer_delete(s_finder_timer);
+        s_finder_timer = NULL;
+        s_finder_complete = true;
+        return;
+    }
+    
+    /* Do an immediate first scan */
+    finder_mode_timer_callback(NULL);
+}
+
+static void stop_finder_mode(bool paired)
+{
+    if (s_finder_timer) {
+        esp_timer_stop(s_finder_timer);
+        esp_timer_delete(s_finder_timer);
+        s_finder_timer = NULL;
+    }
+    
+    s_device_paired_during_finder = paired;
+    s_finder_complete = true;
+    
+    if (paired) {
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║  ✅ FINDER MODE COMPLETE - Device paired successfully!   ║");
+        ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+        s_zigbee_state = ZIGBEE_STATE_READY;
+        
+        /* Print what we found */
+        zigbee_print_network_status();
+    } else {
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║  ⚠️ FINDER MODE TIMEOUT - No devices paired              ║");
+        ESP_LOGW(TAG, "║  Send 'blinds:pair' via MQTT to try again later          ║");
+        ESP_LOGW(TAG, "╚══════════════════════════════════════════════════════════╝");
+        s_zigbee_state = ZIGBEE_STATE_READY;  /* Still ready, just no devices */
+    }
+    ESP_LOGI(TAG, "");
+}
 
 /* ============================================================================
    INITIALIZATION
@@ -115,7 +299,11 @@ static void zb_find_window_covering_cb(esp_zb_zdp_status_t zdo_status, uint16_t 
                                         uint8_t endpoint, void *user_ctx)
 {
     if (zdo_status == ESP_ZB_ZDP_STATUS_SUCCESS) {
-        ESP_LOGI(TAG, "Found Window Covering device at addr 0x%04x, endpoint %d", addr, endpoint);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║  🪟 WINDOW COVERING (BLIND) DEVICE FOUND!                ║");
+        ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "  Address: 0x%04x, Endpoint: %d", addr, endpoint);
         
         /* Store the device */
         zigbee_device_t device = {
@@ -128,7 +316,13 @@ static void zb_find_window_covering_cb(esp_zb_zdp_status_t zdo_status, uint16_t 
         esp_zb_ieee_address_by_short(addr, device.ieee_addr);
         
         zigbee_devices_add(&device);
-        ESP_LOGI(TAG, "Blind device registered! Total devices: %d", zigbee_get_device_count());
+        ESP_LOGI(TAG, "  ✅ Blind registered! Total devices: %d", zigbee_get_device_count());
+        ESP_LOGI(TAG, "");
+        
+        /* If we're in finder mode, stop it - we found our device! */
+        if (s_zigbee_state == ZIGBEE_STATE_FINDER_MODE) {
+            stop_finder_mode(true);
+        }
     }
 }
 
@@ -136,7 +330,11 @@ static void zb_find_on_off_cb(esp_zb_zdp_status_t zdo_status, uint16_t addr,
                                uint8_t endpoint, void *user_ctx)
 {
     if (zdo_status == ESP_ZB_ZDP_STATUS_SUCCESS) {
-        ESP_LOGI(TAG, "Found On/Off device at addr 0x%04x, endpoint %d", addr, endpoint);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║  💡 ON/OFF DEVICE (LIGHT/SWITCH) FOUND!                  ║");
+        ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "  Address: 0x%04x, Endpoint: %d", addr, endpoint);
         
         /* Store as a light device */
         zigbee_device_t device = {
@@ -149,6 +347,13 @@ static void zb_find_on_off_cb(esp_zb_zdp_status_t zdo_status, uint16_t addr,
         esp_zb_ieee_address_by_short(addr, device.ieee_addr);
         
         zigbee_devices_add(&device);
+        ESP_LOGI(TAG, "  ✅ Light device registered! Total devices: %d", zigbee_get_device_count());
+        ESP_LOGI(TAG, "");
+        
+        /* If we're in finder mode, stop it - we found a device! */
+        if (s_zigbee_state == ZIGBEE_STATE_FINDER_MODE) {
+            stop_finder_mode(true);
+        }
     }
 }
 
@@ -182,18 +387,40 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             
             if (esp_zb_bdb_is_factory_new()) {
                 /* First boot - form new network */
+                s_zigbee_state = ZIGBEE_STATE_FORMING_NETWORK;
                 ESP_LOGI(TAG, "Starting network formation...");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_FORMATION);
             } else {
                 /* Subsequent boot - network already formed */
                 s_network_ready = true;
-                ESP_LOGI(TAG, "Network already formed, ready for devices");
+                ESP_LOGI(TAG, "Network already formed");
                 
-                /* Open network briefly for any devices that need to rejoin */
-                esp_zb_bdb_open_network(60);
+                /* Check if we have previously paired devices */
+                int device_count = zigbee_devices_get_count();
+                if (device_count > 0) {
+                    /* We have devices - go to reconnecting mode */
+                    s_zigbee_state = ZIGBEE_STATE_RECONNECTING;
+                    ESP_LOGI(TAG, "Found %d previously paired device(s) - reconnecting...", device_count);
+                    
+                    /* Open network briefly for devices that need to rejoin */
+                    esp_zb_bdb_open_network(30);
+                    
+                    /* Consider finder complete since we have devices */
+                    s_finder_complete = true;
+                    s_zigbee_state = ZIGBEE_STATE_READY;
+                    
+                    /* Print what devices we have */
+                    zigbee_print_network_status();
+                } else {
+                    /* No devices - start finder mode */
+                    ESP_LOGI(TAG, "No previously paired devices - starting finder mode...");
+                    start_finder_mode();
+                }
             }
         } else {
             ESP_LOGE(TAG, "Failed to initialize Zigbee stack: %s", esp_err_to_name(err_status));
+            s_zigbee_state = ZIGBEE_STATE_FAILED;
+            s_finder_complete = true;  /* Don't block boot */
         }
         break;
         
@@ -201,13 +428,17 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status == ESP_OK) {
             esp_zb_ieee_addr_t ieee_address;
             esp_zb_get_long_address(ieee_address);
-            ESP_LOGI(TAG, "Network formed successfully!");
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+            ESP_LOGI(TAG, "║  ✅ ZIGBEE NETWORK FORMED SUCCESSFULLY!                  ║");
+            ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
             ESP_LOGI(TAG, "  Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
                      ieee_address[7], ieee_address[6], ieee_address[5], ieee_address[4],
                      ieee_address[3], ieee_address[2], ieee_address[1], ieee_address[0]);
             ESP_LOGI(TAG, "  PAN ID: 0x%04hx", esp_zb_get_pan_id());
             ESP_LOGI(TAG, "  Channel: %d", esp_zb_get_current_channel());
             ESP_LOGI(TAG, "  Short Address: 0x%04hx", esp_zb_get_short_address());
+            ESP_LOGI(TAG, "");
             
             s_network_ready = true;
             
@@ -223,13 +454,28 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Network steering started - devices can now join");
+            
+            /* This is a fresh network with no devices - start finder mode */
+            if (zigbee_devices_get_count() == 0) {
+                start_finder_mode();
+            } else {
+                s_finder_complete = true;
+                s_zigbee_state = ZIGBEE_STATE_READY;
+            }
         }
         break;
         
     case ESP_ZB_ZDO_SIGNAL_DEVICE_ANNCE:
         /* New device announced itself! */
         dev_annce_params = (esp_zb_zdo_signal_device_annce_params_t *)esp_zb_app_signal_get_params(p_sg_p);
-        ESP_LOGI(TAG, ">>> NEW DEVICE JOINED! Short addr: 0x%04hx", dev_annce_params->device_short_addr);
+        
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║  🎉 NEW ZIGBEE DEVICE JOINED!                            ║");
+        ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "  Short Address: 0x%04hx", dev_annce_params->device_short_addr);
+        ESP_LOGI(TAG, "  Querying device capabilities...");
+        ESP_LOGI(TAG, "");
         
         /* Try to find Window Covering cluster (for blinds) */
         esp_zb_zdo_match_desc_req_param_t match_req;
@@ -247,6 +493,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         
         /* Also try to find On/Off cluster (lights/switches) */
         esp_zb_zdo_find_on_off_light(&match_req, zb_find_on_off_cb, NULL);
+        
+        /* If we're in finder mode, the device callbacks will stop it once registered */
         break;
         
     case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
@@ -505,5 +753,185 @@ esp_err_t zigbee_blind_set_position(uint16_t device_addr, uint8_t percent)
     esp_zb_lock_release();
     
     return ret;
+}
+
+/* ============================================================================
+   DEVICE SCANNING & NETWORK STATUS
+   ============================================================================ */
+
+static const char* device_type_to_string(zigbee_device_type_t type)
+{
+    switch (type) {
+        case ZIGBEE_DEVICE_TYPE_BLIND:   return "BLIND";
+        case ZIGBEE_DEVICE_TYPE_LIGHT:   return "LIGHT";
+        case ZIGBEE_DEVICE_TYPE_SWITCH:  return "SWITCH";
+        default:                         return "UNKNOWN";
+    }
+}
+
+void zigbee_print_network_status(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║              ZIGBEE NETWORK STATUS                       ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+    
+    if (!s_network_ready) {
+        ESP_LOGW(TAG, "  Network: NOT READY");
+        return;
+    }
+    
+    /* Get network info */
+    esp_zb_ieee_addr_t ieee_address;
+    esp_zb_get_long_address(ieee_address);
+    
+    ESP_LOGI(TAG, "  Network: READY");
+    ESP_LOGI(TAG, "  PAN ID: 0x%04hx", esp_zb_get_pan_id());
+    ESP_LOGI(TAG, "  Channel: %d", esp_zb_get_current_channel());
+    ESP_LOGI(TAG, "  Short Address: 0x%04hx", esp_zb_get_short_address());
+    ESP_LOGI(TAG, "  Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+             ieee_address[7], ieee_address[6], ieee_address[5], ieee_address[4],
+             ieee_address[3], ieee_address[2], ieee_address[1], ieee_address[0]);
+    
+    /* List all paired devices */
+    int count = zigbee_devices_get_count();
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  Paired Devices: %d", count);
+    ESP_LOGI(TAG, "  ─────────────────────────────────────────────────────────");
+    
+    if (count == 0) {
+        ESP_LOGI(TAG, "  (no devices paired - send 'blinds:pair' to start pairing)");
+    } else {
+        for (int i = 0; i < count; i++) {
+            const zigbee_device_t *dev = zigbee_devices_get_by_index(i);
+            if (dev) {
+                ESP_LOGI(TAG, "  [%d] Addr: 0x%04x  Endpoint: %d  Type: %-7s  %s",
+                         i, dev->short_addr, dev->endpoint,
+                         device_type_to_string(dev->device_type),
+                         dev->is_online ? "ONLINE" : "OFFLINE");
+                ESP_LOGI(TAG, "      IEEE: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+                         dev->ieee_addr[7], dev->ieee_addr[6], dev->ieee_addr[5], dev->ieee_addr[4],
+                         dev->ieee_addr[3], dev->ieee_addr[2], dev->ieee_addr[1], dev->ieee_addr[0]);
+            }
+        }
+    }
+    ESP_LOGI(TAG, "");
+}
+
+void zigbee_scan_neighbors(void)
+{
+    if (!s_network_ready) {
+        ESP_LOGW(TAG, "Cannot scan neighbors - network not ready");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║              ZIGBEE NEIGHBOR SCAN                        ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
+    
+    /* The Zigbee stack maintains a neighbor table of devices in radio range */
+    /* We can iterate through it to see what's nearby */
+    
+    esp_zb_lock_acquire(portMAX_DELAY);
+    
+    /* Get the neighbor table iterator */
+    esp_zb_nwk_neighbor_info_t neighbor_info;
+    bool found_any = false;
+    esp_zb_nwk_info_iterator_t iterator = 0;  /* Start from beginning */
+    
+    /* Start iteration from beginning */
+    esp_err_t ret = esp_zb_nwk_get_next_neighbor(&iterator, &neighbor_info);
+    
+    while (ret == ESP_OK) {
+        found_any = true;
+        ESP_LOGI(TAG, "  Neighbor: addr=0x%04x, relationship=%d, rx_on=%d, depth=%d, LQI=%d",
+                 neighbor_info.short_addr,
+                 neighbor_info.relationship,
+                 neighbor_info.rx_on_when_idle,
+                 neighbor_info.depth,
+                 neighbor_info.lqi);
+        
+        /* Get next neighbor */
+        ret = esp_zb_nwk_get_next_neighbor(&iterator, &neighbor_info);
+    }
+    
+    esp_zb_lock_release();
+    
+    if (!found_any) {
+        ESP_LOGI(TAG, "  (no neighbors found in radio range)");
+    }
+    ESP_LOGI(TAG, "");
+}
+
+/* Timer callback for periodic scanning */
+static void scan_timer_callback(void *arg)
+{
+    if (!s_network_ready) {
+        return;
+    }
+    
+    /* Print network status and device list */
+    zigbee_print_network_status();
+    
+    /* Scan neighbors in radio range */
+    zigbee_scan_neighbors();
+    
+    /* Keep network open for devices that want to join */
+    /* This allows new devices in pairing mode to be discovered */
+    ESP_LOGI(TAG, "  Keeping network open for new devices...");
+    esp_zb_bdb_open_network(s_scan_interval_sec + 5);  /* Keep open until next scan */
+}
+
+void zigbee_start_device_scan(uint16_t interval_sec)
+{
+    /* Stop existing timer if running */
+    zigbee_stop_device_scan();
+    
+    if (interval_sec == 0) {
+        ESP_LOGI(TAG, "Device scanning disabled");
+        return;
+    }
+    
+    s_scan_interval_sec = interval_sec;
+    
+    /* Create timer */
+    esp_timer_create_args_t timer_args = {
+        .callback = scan_timer_callback,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "zb_scan_timer",
+    };
+    
+    esp_err_t ret = esp_timer_create(&timer_args, &s_scan_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create scan timer: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    /* Start periodic timer */
+    ret = esp_timer_start_periodic(s_scan_timer, (uint64_t)interval_sec * 1000000);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start scan timer: %s", esp_err_to_name(ret));
+        esp_timer_delete(s_scan_timer);
+        s_scan_timer = NULL;
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Device scanning started (every %d seconds)", interval_sec);
+    
+    /* Do an immediate scan */
+    scan_timer_callback(NULL);
+}
+
+void zigbee_stop_device_scan(void)
+{
+    if (s_scan_timer) {
+        esp_timer_stop(s_scan_timer);
+        esp_timer_delete(s_scan_timer);
+        s_scan_timer = NULL;
+        ESP_LOGI(TAG, "Device scanning stopped");
+    }
+    s_scan_interval_sec = 0;
 }
 
