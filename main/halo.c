@@ -637,6 +637,9 @@ static int rtttl_note_to_index(char note) {
     }
 }
 
+/* Melody cancellation flag - used to interrupt song playback */
+static volatile bool melody_cancel_requested = false;
+
 /* Play RTTTL ringtone string directly (blocking) */
 static void buzzer_play_rtttl(const char *rtttl)
 {
@@ -679,6 +682,12 @@ static void buzzer_play_rtttl(const char *rtttl)
     
     /* Parse and play notes */
     while (*p) {
+        /* Check if cancellation was requested */
+        if (melody_cancel_requested) {
+            buzzer_stop();
+            return;  /* Exit early - song cancelled */
+        }
+        
         /* Skip whitespace and commas */
         while (*p == ' ' || *p == ',') p++;
         if (!*p) break;
@@ -783,8 +792,13 @@ static const char * const SONG_LIBRARY[] = {
    animation loop continues running. This is similar to JavaScript's event loop!
    ============================================================================ */
 
-/* Flag to track if a melody is currently playing (blocks button input) */
+/* Flag to track if a melody is currently playing */
 static volatile bool melody_playing = false;
+
+/* melody_cancel_requested is declared earlier (before buzzer_play_rtttl) */
+
+/* Current song index (to avoid repeating same song) */
+static volatile int current_song_index = -1;
 
 /* Queue handle for song requests */
 static QueueHandle_t melody_queue = NULL;
@@ -799,7 +813,10 @@ static void melody_task(void *pvParameters)
     while (1) {
         /* Wait for a song request (blocks until something is in the queue) */
         if (xQueueReceive(melody_queue, &song_index, portMAX_DELAY) == pdTRUE) {
+            /* Clear any pending cancel request from previous song */
+            melody_cancel_requested = false;
             melody_playing = true;
+            current_song_index = song_index;
             
             ESP_LOGI(TAG_BUZZER, "Playing song %d of %d", song_index + 1, (int)SONG_LIBRARY_SIZE);
             
@@ -807,6 +824,12 @@ static void melody_task(void *pvParameters)
             buzzer_play_rtttl(SONG_LIBRARY[song_index]);
             
             melody_playing = false;
+            
+            /* If cancelled, the new song will be queued by the caller */
+            if (melody_cancel_requested) {
+                ESP_LOGI(TAG_BUZZER, "Song cancelled");
+                melody_cancel_requested = false;
+            }
         }
     }
 }
@@ -842,14 +865,28 @@ static void init_melody_task(void)
 /* Request a random song to play (non-blocking - returns immediately) */
 static void buzzer_play_random_song(void)
 {
-    if (melody_playing || melody_queue == NULL) {
-        /* Already playing a song or queue not initialized, ignore */
-        return;
+    if (melody_queue == NULL) {
+        return;  /* Queue not initialized */
     }
     
-    /* Pick a random song */
-    uint32_t random_val = esp_random();
-    int song_index = random_val % SONG_LIBRARY_SIZE;
+    /* If a song is currently playing, cancel it first */
+    if (melody_playing) {
+        ESP_LOGI(TAG_BUZZER, "Cancelling current song...");
+        melody_cancel_requested = true;
+        buzzer_stop();  /* Stop buzzer immediately */
+        
+        /* Brief delay to let melody task process the cancellation */
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+    
+    /* Pick a random song (different from current if possible) */
+    int song_index;
+    int attempts = 0;
+    do {
+        uint32_t random_val = esp_random();
+        song_index = random_val % SONG_LIBRARY_SIZE;
+        attempts++;
+    } while (song_index == current_song_index && attempts < 5 && SONG_LIBRARY_SIZE > 1);
     
     /* Queue the song (non-blocking - if queue is full, just ignore) */
     xQueueSend(melody_queue, &song_index, 0);
@@ -1420,7 +1457,7 @@ static bool is_melody_button_pressed(void)
     return gpio_get_level(MELODY_BUTTON_GPIO) == 0;
 }
 
-/* Standby mode: dim pink on ONBOARD LED only, waiting for button press
+/* Standby mode: bright neon pink on ONBOARD LED only, waiting for button press
    NO signals sent to NeoPixel GPIO - safe to have nothing connected.
    Returns true when button is pressed (time to wake up) */
 static bool run_standby_mode(void)
@@ -1430,11 +1467,11 @@ static bool run_standby_mode(void)
     ESP_LOGI(TAG, "║     STANDBY MODE - Press button to start                 ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, ">>> NeoPixel GPIO is IDLE - safe to disconnect.");
-    ESP_LOGI(TAG, ">>> Onboard LED: dim pink");
+    ESP_LOGI(TAG, ">>> Onboard LED: neon pink");
     ESP_LOGI(TAG, "");
     
-    /* Set onboard LED to dim pink: R=12, G=2, B=8 */
-    set_onboard_led_rgb_internal(12, 2, 8);
+    /* Set onboard LED to bright neon pink: R=255, G=20, B=147 (hot pink) */
+    set_onboard_led_rgb_internal(255, 20, 147);
     
     while (1) {
         /* Check for button press */
@@ -3270,8 +3307,8 @@ void app_main(void)
                 }
             }
             
-            /* Check melody button during gauge display too */
-            if (is_melody_button_pressed() && !melody_playing) {
+            /* Check melody button during gauge display too (cancels and restarts if playing) */
+            if (is_melody_button_pressed()) {
                 vTaskDelay(50 / portTICK_PERIOD_MS);
                 if (is_melody_button_pressed()) {
                     while (is_melody_button_pressed()) {
@@ -3433,7 +3470,8 @@ void app_main(void)
         }
         
         /* === CHECK MELODY BUTTON (External button - GPIO5) === */
-        if (is_melody_button_pressed() && !melody_playing) {
+        /* Now allows triggering even during playback (cancels and starts new song) */
+        if (is_melody_button_pressed()) {
             /* Debounce */
             vTaskDelay(50 / portTICK_PERIOD_MS);
             if (is_melody_button_pressed()) {
@@ -3443,7 +3481,7 @@ void app_main(void)
                 }
                 vTaskDelay(50 / portTICK_PERIOD_MS);  /* Debounce release */
                 
-                /* Play a random song (this is blocking but that's OK) */
+                /* Play a random song (cancels current if playing) */
                 buzzer_play_random_song();
             }
         }
