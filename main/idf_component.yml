@@ -2,3 +2,4 @@ dependencies:
   espressif/led_strip: "^3.0.0"
   espressif/esp-zboss-lib: "~1.6.0"    # Zigbee stack (ZBOSS)
   espressif/esp-zigbee-lib: "~1.6.0"   # Zigbee API library
+  espressif/mqtt: "*"                   # MQTT client

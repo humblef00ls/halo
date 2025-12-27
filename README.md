@@ -123,16 +123,21 @@ Just... a solid color. No animation. Set a color and it stays.
 
 ### The Two Boards
 
-**ESP32-C6** (main controller) - the brains, always on
+**Halo Hub - ESP32-C6** (main controller) - the brains, always on
 
 - Controls LEDs, buzzer, Zigbee, presence detection
 - Handles WiFi and MQTT commands
+- Monitors power status, enters low power mode on battery
 
-**XIAO ESP32S3 Sense** (camera module) - sleeps until needed
+**Angel - XIAO ESP32S3 Sense** (camera module) - always on
 
-- Has camera and microphone built-in
-- Wakes up when the radar detects someone
+- Has camera, microphone, and SD card built-in
+- Has built-in LiPo battery charger (JST-SH 1.0mm connector)
+- Runs 24/7 as a security camera (always watching)
 - Takes photos, uploads to cloud for AI analysis
+- Can detach and run independently on battery
+- Operates identically whether plugged in or not
+- Battery provides backup power to Halo when main power goes out
 
 ### What's Connected Where
 
@@ -140,25 +145,24 @@ Just... a solid color. No animation. Set a color and it stays.
 
 ```
 ESP32-C6
+├── GPIO 1  → Power detect (ADC, voltage divider from barrel jack)
 ├── GPIO 4  → NeoPixel LED Ring (45 LEDs)
 ├── GPIO 23 → Passive Buzzer
 ├── GPIO 22 → MOSFET gate (12V nOOds)
-├── GPIO 1  → Potentiometer (brightness)
 │
 ├── UART (GPIO 2, 3)
 │   └── mmWave Radar (presence detection)
 │
 ├── I2C (GPIO 6, 7)
-│   └── Charlieplex Matrix (future)
+│   └── Charlieplex Matrix
 │
-├── I2S (GPIO 10, 11, 12)
-│   └── INMP441 Microphone (future)
+├── Buttons (GPIO 10, 11, 13)
+│   └── Button 1, 2, 3
 │
-├── Buttons & Encoder (GPIO 13-20)
-│   ├── Button 1, 2, 3
-│   └── Rotary Encoder (A, B, click)
+├── Rotary Encoder (GPIO 19, 21, 18)
+│   └── A, B, Switch
 │
-├── GPIO 21 → Wake signal to XIAO
+├── GPIO 20 → mmWave radar OT2 (presence interrupt)
 │
 ├── GPIO 9  → Boot button (power on/off)
 ├── GPIO 5  → Melody button
@@ -167,59 +171,64 @@ ESP32-C6
 └── Internal 802.15.4 radio → Zigbee (no GPIO needed)
 ```
 
-#### XIAO ESP32S3 Sense Connections
+#### Angel Connections (XIAO ESP32S3 Sense)
+
+Angel runs 24/7 as an always-on security camera. It operates identically whether wall power is present or not - no wake signal needed.
 
 ```
 XIAO ESP32S3 Sense
 ├── Built-in camera (OV2640)
 ├── Built-in microphone (PDM)
 ├── Built-in SD card slot
+├── Built-in LiPo charger (JST-SH 1.0mm connector)
 │
-├── GPIO 1 ← Wake input from ESP32-C6
-│
-└── Power from 3.3V (shared with ESP32-C6)
+└── 4-Wire Pogo Cable to Halo Hub
+    ├── 5V      → From Halo 5V rail (charges battery when wall power on)
+    ├── GND     → Common ground
+    ├── Batt+   → Battery+ to Halo MT3608 #2 (backup power)
+    └── DATA    → GPIO 15 (signal line for future use)
 ```
+
+When detached, Angel runs independently on battery. When connected, wall power charges the battery and the battery provides backup power to Halo if wall power fails.
 
 ### Power
 
-Everything runs off a 5V 6A power supply.
+Main power is 5V 6A from a barrel jack. There's also a battery backup so the system doesn't just die when power goes out.
 
 ```
-5V 6A Supply
-├── ESP32-C6 (directly)
-├── NeoPixels (directly, with 1000µF cap for smoothing)
-├── XIAO ESP32S3 (via 3.3V from ESP32-C6)
+5V Barrel Jack
+├── D1 (Schottky) ──► 5V Rail
+│                     ├── ESP32-C6
+│                     ├── NeoPixels (with 1000µF cap)
+│                     └── MT3608 #1 (5V → 12V)
+│                         └── MOSFET → 12V nOOds
 │
-└── MT3608 Boost (5V → 12V)
-    └── MOSFET
-        └── 12V nOOds
+└── XIAO 5V pin ──► XIAO ESP32S3
+                    └── Built-in charger ──► LiPo Battery
+                                              │
+                                              └── MT3608 #2 (3.7V → 5V)
+                                                  └── D2 (Schottky) ──► 5V Rail
 ```
+
+**When plugged in:** Main 5V powers everything through D1. XIAO charges the battery.
+
+**When unplugged:** Battery → MT3608 #2 → D2 → 5V rail. Halo enters low power mode (dim nightlight only).
+
+**Power loss detection:** Voltage divider (2× 10kΩ) on GPIO1 monitors the barrel jack input (before D1). When it drops to 0V, ESP32-C6 knows it's running on battery and enters low power mode.
 
 ### Parts List
 
-**Have:**
+See **[PARTS.md](PARTS.md)** for the full bill of materials with descriptions, GPIO assignments, and shopping list.
 
-- Waveshare ESP32-C6-DEV-KIT-N8
-- 45× SK6812 RGBW NeoPixels
-- Passive buzzer
-- 10K potentiometer
-- 5V 6A power supply
-- MT3608 boost module
-- IRLB8721 N-MOSFET
-- 1000µF capacitor
+Quick summary:
 
-**Ordered:**
-
-- XIAO ESP32S3 Sense (camera + mic)
-- Waveshare mmWave Radar
-
-**To buy:**
-
-- INMP441 I2S microphone (~$5)
-- Adafruit Charlieplex Matrix (~$15)
-- 12V nOOds LED Filament (~$8)
-- Rotary encoder (~$3)
-- 3× tactile buttons (~$2)
+| Category | Key Parts                                                     |
+| -------- | ------------------------------------------------------------- |
+| Halo Hub | ESP32-C6, 45× NeoPixels, buzzer, mmWave radar, matrix display |
+| Angel    | XIAO ESP32S3 Sense, 380mAh LiPo battery                       |
+| Power    | 5V 6A supply, 2× MT3608 boost, 2× Schottky diodes, MOSFET     |
+| Input    | 3× buttons, rotary encoder                                    |
+| Accent   | 12V nOOds LED filament                                        |
 
 ---
 
@@ -252,16 +261,16 @@ Say these through Google Home (via IFTTT → Adafruit IO → MQTT):
 
 ## The Security Camera Thing
 
-Here's how it works:
+Angel runs 24/7 as an always-on security camera. Here's how it works:
 
-1. **mmWave radar** is always watching (very low power, no camera involved)
-2. **Nobody home?** XIAO is in deep sleep
-3. **Someone detected?** ESP32-C6 wakes XIAO via GPIO
-4. **Camera turns on**, takes photos every 2 seconds
-5. Photos go to cloud storage
-6. Cloud function runs AI (GPT-4V or similar) to check: is this me or a stranger?
-7. **Stranger?** Send a Telegram/SMS alert with the photo
-8. **It's me?** Log it, maybe trigger a "welcome home" thing
+1. **Camera is always watching** - continuous operation, battery or wall power
+2. Takes photos periodically or on motion detection
+3. Photos go to cloud storage
+4. Cloud function runs AI (GPT-4V or similar) to check: is this me or a stranger?
+5. **Stranger?** Send a Telegram/SMS alert with the photo
+6. **It's me?** Log it, maybe trigger a "welcome home" thing
+
+**mmWave radar** on Halo provides additional presence detection for automations (lights, alerts, etc.)
 
 The XIAO can also stream live video (MJPEG at 10-15 FPS) if you want to check in remotely.
 
@@ -288,16 +297,18 @@ If WiFi fails, it blinks red. Press the boot button to enter standby mode.
 ```
 halo/
 ├── main/
-│   ├── halo.c                 # Main code
+│   ├── halo.c                 # Halo Hub main code
 │   ├── zigbee_hub.c/.h        # Zigbee coordinator
 │   ├── zigbee_devices.c/.h    # Device storage (NVS)
 │   ├── credentials.h          # Your secrets (gitignored)
 │   └── credentials.h.template
-├── cad_mk1/
-│   └── cad_mk1.kicad_sch      # KiCad schematic
-├── xiao_camera/               # (Future) XIAO firmware
+├── angel/                     # (Future) XIAO ESP32S3 firmware
+│   └── angel.c                # Camera, mic, cloud upload
+├── schematics/
+│   └── halo.kicad_sch         # KiCad schematic
 ├── partitions.csv
 ├── sdkconfig.defaults
+├── PARTS.md                   # Full bill of materials + GPIO map
 └── README.md
 ```
 
@@ -328,15 +339,26 @@ idf.py flash monitor
 
 ## Future Plans
 
+### Halo Hub (ESP32-C6)
+
 - [ ] mmWave presence detection
-- [ ] XIAO camera integration
-- [ ] AI face recognition + alerts
-- [ ] INMP441 microphone (music visualization, clap detection)
 - [ ] Charlieplex matrix display
 - [ ] 12V nOOds accent lighting
 - [ ] Rotary encoder + buttons
-- [ ] Voice commands via Whisper API
+- [ ] Battery backup with low power mode
+- [ ] Power loss detection (auto-switch to nightlight mode)
 - [ ] Matter support (native HomeKit/Google Home)
+
+### Angel (XIAO ESP32S3 Sense)
+
+- [ ] Camera integration with Halo
+- [ ] AI face recognition + stranger alerts
+- [ ] Photo capture on presence detection
+- [ ] Cloud upload (Google Cloud Storage or similar)
+- [ ] Live video streaming (MJPEG)
+- [ ] Voice commands via built-in mic + Whisper API
+- [ ] Portable/detachable operation on battery
+- [ ] Backup battery for Halo when main power goes out
 
 ---
 
