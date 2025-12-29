@@ -110,18 +110,50 @@ esp_err_t zigbee_devices_init(void)
    DEVICE MANAGEMENT
    ============================================================================ */
 
+/* Check if IEEE address is all zeros (invalid) */
+static bool is_ieee_addr_zero(const uint8_t *ieee_addr)
+{
+    for (int i = 0; i < 8; i++) {
+        if (ieee_addr[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 esp_err_t zigbee_devices_add(const zigbee_device_t *device)
 {
     if (!device) {
         return ESP_ERR_INVALID_ARG;
     }
     
-    /* Check if device already exists (by IEEE address) */
+    /* Validate device address - 0xffff is broadcast, not valid */
+    if (device->short_addr == 0xffff) {
+        ESP_LOGW(TAG, "Ignoring device with broadcast address 0xffff");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    /* Check if device already exists */
     for (int i = 0; i < s_device_count; i++) {
-        if (memcmp(s_devices[i].ieee_addr, device->ieee_addr, 8) == 0) {
-            /* Update existing device */
+        bool match_by_ieee = !is_ieee_addr_zero(device->ieee_addr) && 
+                             !is_ieee_addr_zero(s_devices[i].ieee_addr) &&
+                             memcmp(s_devices[i].ieee_addr, device->ieee_addr, 8) == 0;
+        bool match_by_short = s_devices[i].short_addr == device->short_addr;
+        
+        if (match_by_ieee || match_by_short) {
+            /* Update existing device, but preserve BLIND type if already set */
             ESP_LOGI(TAG, "Updating existing device 0x%04x", device->short_addr);
+            
+            zigbee_device_type_t preserved_type = s_devices[i].device_type;
             memcpy(&s_devices[i], device, sizeof(zigbee_device_t));
+            
+            /* Don't let LIGHT overwrite BLIND - blinds have Window Covering which is more specific */
+            if (preserved_type == ZIGBEE_DEVICE_TYPE_BLIND && 
+                device->device_type == ZIGBEE_DEVICE_TYPE_LIGHT) {
+                ESP_LOGI(TAG, "Preserving BLIND type (not overwriting with LIGHT)");
+                s_devices[i].device_type = ZIGBEE_DEVICE_TYPE_BLIND;
+            }
+            
             return zigbee_devices_save();
         }
     }
@@ -250,9 +282,10 @@ void zigbee_devices_print_all(void)
         const char *type_str = "Unknown";
         
         switch (dev->device_type) {
-            case ZIGBEE_DEVICE_TYPE_BLIND:  type_str = "Blind"; break;
-            case ZIGBEE_DEVICE_TYPE_LIGHT:  type_str = "Light"; break;
-            case ZIGBEE_DEVICE_TYPE_SWITCH: type_str = "Switch"; break;
+            case ZIGBEE_DEVICE_TYPE_BLIND:      type_str = "Blind"; break;
+            case ZIGBEE_DEVICE_TYPE_TUYA_BLIND: type_str = "TuyaBlind"; break;
+            case ZIGBEE_DEVICE_TYPE_LIGHT:      type_str = "Light"; break;
+            case ZIGBEE_DEVICE_TYPE_SWITCH:     type_str = "Switch"; break;
             default: break;
         }
         

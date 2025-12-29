@@ -42,9 +42,10 @@ typedef enum {
 
 typedef enum {
     ZIGBEE_DEVICE_TYPE_UNKNOWN = 0,
-    ZIGBEE_DEVICE_TYPE_BLIND,           /* Window covering / blind */
+    ZIGBEE_DEVICE_TYPE_BLIND,           /* Window covering / blind (standard) */
     ZIGBEE_DEVICE_TYPE_LIGHT,           /* On/Off light */
     ZIGBEE_DEVICE_TYPE_SWITCH,          /* On/Off switch */
+    ZIGBEE_DEVICE_TYPE_TUYA_BLIND,      /* Tuya/MoES blind (uses 0xEF00 cluster) */
 } zigbee_device_type_t;
 
 /* ============================================================================
@@ -177,6 +178,17 @@ esp_err_t zigbee_blind_stop(uint16_t device_addr);
  */
 esp_err_t zigbee_blind_set_position(uint16_t device_addr, uint8_t percent);
 
+/**
+ * @brief Query blind current position
+ * 
+ * Sends a read request to get the blind's current position.
+ * Response will be logged when received.
+ * 
+ * @param device_addr Short address of the blind (0 for first blind)
+ * @return ESP_OK on success
+ */
+esp_err_t zigbee_blind_query_position(uint16_t device_addr);
+
 /* ============================================================================
    DEVICE SCANNING & MONITORING
    ============================================================================ */
@@ -210,6 +222,20 @@ void zigbee_print_network_status(void);
  * This shows devices that are currently in radio range.
  */
 void zigbee_scan_neighbors(void);
+
+/* ============================================================================
+   DEBUG MODE
+   ============================================================================ */
+
+/**
+ * @brief Start debug mode - queries blind position every 5 seconds
+ */
+void zigbee_start_debug_mode(void);
+
+/**
+ * @brief Stop debug mode
+ */
+void zigbee_stop_debug_mode(void);
 
 #endif /* ZIGBEE_HUB_H */
 

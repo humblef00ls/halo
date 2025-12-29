@@ -3719,7 +3719,7 @@
 	)
 	(wire
 		(pts
-			(xy 231.14 60.96) (xy 231.14 87.63)
+			(xy 231.14 59.69) (xy 231.14 87.63)
 		)
 		(stroke
 			(width 0)
@@ -3746,16 +3746,6 @@
 			(type default)
 		)
 		(uuid "101a1367-115a-4440-8ccf-01c4632a0fb5")
-	)
-	(wire
-		(pts
-			(xy 33.02 60.96) (xy 43.18 60.96)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "104648ab-ce9a-4315-9447-016c38f0d62a")
 	)
 	(wire
 		(pts
@@ -4049,7 +4039,7 @@
 	)
 	(wire
 		(pts
-			(xy 152.4 114.3) (xy 152.4 120.65)
+			(xy 154.94 113.03) (xy 154.94 119.38)
 		)
 		(stroke
 			(width 0)
@@ -4289,7 +4279,7 @@
 	)
 	(wire
 		(pts
-			(xy 134.62 110.49) (xy 134.62 165.1)
+			(xy 134.62 109.22) (xy 134.62 165.1)
 		)
 		(stroke
 			(width 0)
@@ -4319,7 +4309,7 @@
 	)
 	(wire
 		(pts
-			(xy 125.73 132.08) (xy 125.73 125.73)
+			(xy 127 132.08) (xy 127 124.46)
 		)
 		(stroke
 			(width 0)
@@ -4439,7 +4429,7 @@
 	)
 	(wire
 		(pts
-			(xy 152.4 114.3) (xy 191.77 114.3)
+			(xy 154.94 113.03) (xy 191.77 113.03)
 		)
 		(stroke
 			(width 0)
@@ -4609,16 +4599,6 @@
 	)
 	(wire
 		(pts
-			(xy 43.18 25.4) (xy 43.18 60.96)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "68f368a9-0f65-4af4-8310-997b97b169b8")
-	)
-	(wire
-		(pts
 			(xy 69.85 134.62) (xy 77.47 134.62)
 		)
 		(stroke
@@ -4759,7 +4739,7 @@
 	)
 	(wire
 		(pts
-			(xy 33.02 82.55) (xy 33.02 60.96)
+			(xy 33.02 25.4) (xy 33.02 82.55)
 		)
 		(stroke
 			(width 0)
@@ -4779,7 +4759,7 @@
 	)
 	(wire
 		(pts
-			(xy 182.88 110.49) (xy 134.62 110.49)
+			(xy 182.88 109.22) (xy 134.62 109.22)
 		)
 		(stroke
 			(width 0)
@@ -4789,7 +4769,7 @@
 	)
 	(wire
 		(pts
-			(xy 182.88 73.66) (xy 182.88 110.49)
+			(xy 182.88 73.66) (xy 182.88 109.22)
 		)
 		(stroke
 			(width 0)
@@ -4889,7 +4869,7 @@
 	)
 	(wire
 		(pts
-			(xy 125.73 125.73) (xy 147.32 125.73)
+			(xy 127 124.46) (xy 149.86 124.46)
 		)
 		(stroke
 			(width 0)
@@ -4949,7 +4929,7 @@
 	)
 	(wire
 		(pts
-			(xy 114.3 132.08) (xy 125.73 132.08)
+			(xy 114.3 132.08) (xy 127 132.08)
 		)
 		(stroke
 			(width 0)
@@ -5049,7 +5029,7 @@
 	)
 	(wire
 		(pts
-			(xy 124.46 60.96) (xy 231.14 60.96)
+			(xy 124.46 59.69) (xy 231.14 59.69)
 		)
 		(stroke
 			(width 0)
@@ -5399,7 +5379,7 @@
 	)
 	(wire
 		(pts
-			(xy 191.77 114.3) (xy 191.77 121.92)
+			(xy 191.77 113.03) (xy 191.77 121.92)
 		)
 		(stroke
 			(width 0)
@@ -5519,7 +5499,7 @@
 	)
 	(wire
 		(pts
-			(xy 124.46 91.44) (xy 124.46 60.96)
+			(xy 124.46 91.44) (xy 124.46 59.69)
 		)
 		(stroke
 			(width 0)
@@ -5599,7 +5579,7 @@
 	)
 	(wire
 		(pts
-			(xy 187.96 25.4) (xy 43.18 25.4)
+			(xy 187.96 25.4) (xy 33.02 25.4)
 		)
 		(stroke
 			(width 0)
@@ -7134,17 +7114,16 @@
 	)
 	(symbol
 		(lib_id "Device:LED_45deg")
-		(at 149.86 123.19 0)
+		(at 152.4 121.92 0)
 		(mirror x)
 		(unit 1)
 		(exclude_from_sim no)
 		(in_bom yes)
 		(on_board yes)
 		(dnp no)
-		(fields_autoplaced yes)
 		(uuid "8fab1156-504e-4170-9aae-b6d5617ef73c")
 		(property "Reference" "D1"
-			(at 149.86 113.03 0)
+			(at 148.336 113.792 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7152,7 +7131,7 @@
 			)
 		)
 		(property "Value" "FLARE"
-			(at 149.86 115.57 0)
+			(at 148.336 116.332 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7160,7 +7139,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 149.86 123.19 0)
+			(at 152.4 121.92 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7169,7 +7148,7 @@
 			)
 		)
 		(property "Datasheet" "~"
-			(at 149.86 123.19 0)
+			(at 152.4 121.92 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7178,7 +7157,7 @@
 			)
 		)
 		(property "Description" "Light emitting diode, rotated by 45°"
-			(at 149.86 123.19 0)
+			(at 152.4 121.92 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7187,7 +7166,7 @@
 			)
 		)
 		(property "Sim.Pins" "1=K 2=A"
-			(at 149.86 118.11 0)
+			(at 148.59 118.618 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7710,10 +7689,9 @@
 		(in_bom yes)
 		(on_board yes)
 		(dnp no)
-		(fields_autoplaced yes)
 		(uuid "c47b4d1d-f4ae-41ef-bceb-805681fa41d6")
 		(property "Reference" "J6"
-			(at 157.48 153.6699 0)
+			(at 157.226 152.908 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -8204,10 +8182,9 @@
 		(in_bom yes)
 		(on_board yes)
 		(dnp no)
-		(fields_autoplaced yes)
 		(uuid "eb1a53cf-7c75-415f-90e5-33cbfe2a75cd")
 		(property "Reference" "J7"
-			(at 243.84 137.1599 0)
+			(at 245.872 137.668 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -8216,7 +8193,7 @@
 			)
 		)
 		(property "Value" "MATRIX"
-			(at 243.84 139.6999 0)
+			(at 243.84 139.954 0)
 			(effects
 				(font
 					(size 1.27 1.27)

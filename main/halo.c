@@ -455,19 +455,21 @@ static void log_system_metrics(void)
     int uptime_min = uptime_sec / 60;
     int uptime_hrs = uptime_min / 60;
     
-    /* Log metrics */
-    ESP_LOGI(TAG_METRICS, "=== System Metrics ===");
-    ESP_LOGI(TAG_METRICS, "Uptime: %dh %dm %ds", 
-             uptime_hrs, uptime_min % 60, uptime_sec % 60);
-    ESP_LOGI(TAG_METRICS, "Heap: %u KB free (min: %u KB, internal: %u KB)",
-             (unsigned)(free_heap / 1024), 
-             (unsigned)(min_free_heap / 1024),
-             (unsigned)(free_internal / 1024));
-    ESP_LOGI(TAG_METRICS, "Zigbee: %s, %d devices",
-             zigbee_is_network_ready() ? "ready" : "not ready",
-             zigbee_get_device_count());
-    ESP_LOGI(TAG_METRICS, "Animation: mode %d, speed %.2f, brightness %.0f%%",
-             current_animation, animation_speed, pot_brightness * 100);
+    /* Log metrics - COMMENTED OUT FOR ZIGBEE DEBUG */
+    // ESP_LOGI(TAG_METRICS, "=== System Metrics ===");
+    // ESP_LOGI(TAG_METRICS, "Uptime: %dh %dm %ds", 
+    //          uptime_hrs, uptime_min % 60, uptime_sec % 60);
+    // ESP_LOGI(TAG_METRICS, "Heap: %u KB free (min: %u KB, internal: %u KB)",
+    //          (unsigned)(free_heap / 1024), 
+    //          (unsigned)(min_free_heap / 1024),
+    //          (unsigned)(free_internal / 1024));
+    // ESP_LOGI(TAG_METRICS, "Zigbee: %s, %d devices",
+    //          zigbee_is_network_ready() ? "ready" : "not ready",
+    //          zigbee_get_device_count());
+    // ESP_LOGI(TAG_METRICS, "Animation: mode %d, speed %.2f, brightness %.0f%%",
+    //          current_animation, animation_speed, pot_brightness * 100);
+    (void)uptime_hrs; (void)uptime_min; (void)uptime_sec;  /* Suppress unused warnings */
+    (void)free_heap; (void)min_free_heap; (void)free_internal;
 }
 
 /* ============================================================================
@@ -963,8 +965,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-/* Scan for available WiFi networks (for debugging) */
-static void wifi_scan_networks(void)
+/* Scan for available WiFi networks (for debugging) 
+   Returns true if networks were found, false if scan found nothing */
+static bool wifi_scan_networks(void)
 {
     ESP_LOGI(TAG_WIFI, "");
     ESP_LOGI(TAG_WIFI, "╔══════════════════════════════════════════════════════════╗");
@@ -985,7 +988,7 @@ static void wifi_scan_networks(void)
     esp_err_t ret = esp_wifi_scan_start(&scan_config, true);  /* Blocking scan */
     if (ret != ESP_OK) {
         ESP_LOGE(TAG_WIFI, "Scan failed: %s", esp_err_to_name(ret));
-        return;
+        return false;
     }
     
     /* Get results */
@@ -993,8 +996,8 @@ static void wifi_scan_networks(void)
     esp_wifi_scan_get_ap_num(&ap_count);
     
     if (ap_count == 0) {
-        ESP_LOGW(TAG_WIFI, "  ❌ NO NETWORKS FOUND! Check antenna/location.");
-        return;
+        ESP_LOGW(TAG_WIFI, "  ❌ NO NETWORKS FOUND! Radio may need reset.");
+        return false;
     }
     
     ESP_LOGI(TAG_WIFI, "  Found %d networks:", ap_count);
@@ -1002,7 +1005,7 @@ static void wifi_scan_networks(void)
     wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
     if (ap_list == NULL) {
         ESP_LOGE(TAG_WIFI, "  Failed to allocate memory for scan results");
-        return;
+        return false;
     }
     
     esp_wifi_scan_get_ap_records(&ap_count, ap_list);
@@ -1036,6 +1039,7 @@ static void wifi_scan_networks(void)
     
     free(ap_list);
     ESP_LOGI(TAG_WIFI, "");
+    return true;  /* Networks were found */
 }
 
 /* Initialize and connect to WiFi (non-blocking, returns immediately) */
@@ -1083,7 +1087,41 @@ static void wifi_init_start(void)
     
     /* Do a quick scan first to see what networks are available (helps debug) */
     vTaskDelay(100 / portTICK_PERIOD_MS);  /* Brief delay to let WiFi fully start */
-    wifi_scan_networks();
+    
+    /* Scan for networks - if none found, radio may need reset */
+    bool networks_found = wifi_scan_networks();
+    
+    /* AGGRESSIVE RETRY: If no networks found at all, reset WiFi and try again */
+    if (!networks_found) {
+        #define WIFI_RADIO_RESET_MAX_RETRIES 3
+        for (int retry = 1; retry <= WIFI_RADIO_RESET_MAX_RETRIES && !networks_found; retry++) {
+            ESP_LOGW(TAG_WIFI, "");
+            ESP_LOGW(TAG_WIFI, "╔══════════════════════════════════════════════════════════╗");
+            ESP_LOGW(TAG_WIFI, "║  🔄 RADIO RESET RETRY %d/%d - No networks found!         ║", 
+                     retry, WIFI_RADIO_RESET_MAX_RETRIES);
+            ESP_LOGW(TAG_WIFI, "╚══════════════════════════════════════════════════════════╝");
+            
+            /* Stop WiFi */
+            esp_wifi_stop();
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            
+            /* Restart WiFi */
+            esp_wifi_start();
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            
+            /* Try scan again */
+            networks_found = wifi_scan_networks();
+        }
+        
+        if (!networks_found) {
+            ESP_LOGE(TAG_WIFI, "");
+            ESP_LOGE(TAG_WIFI, "╔══════════════════════════════════════════════════════════╗");
+            ESP_LOGE(TAG_WIFI, "║  ❌ RADIO FAILURE - No networks after %d resets!         ║",
+                     WIFI_RADIO_RESET_MAX_RETRIES);
+            ESP_LOGE(TAG_WIFI, "║  This may be a hardware issue or severe interference.   ║");
+            ESP_LOGE(TAG_WIFI, "╚══════════════════════════════════════════════════════════╝");
+        }
+    }
     
     /* Now start the actual connection */
     ESP_LOGI(TAG_WIFI, "Starting connection to %s...", WIFI_SSID);
@@ -1280,6 +1318,27 @@ static void handle_mqtt_command(const char *data, int data_len)
     else if (strcmp(command, "blinds:stop") == 0) {
         ESP_LOGI(TAG_MQTT, "Zigbee: Stopping blinds");
         zigbee_blind_stop(0);
+    }
+    else if (strcmp(command, "blinds:status") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Printing device status...");
+        zigbee_print_network_status();
+    }
+    else if (strcmp(command, "blinds:query") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Querying blind position...");
+        zigbee_blind_query_position(0);
+    }
+    else if (strcmp(command, "blinds:debug") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Starting debug mode (query every 5s)...");
+        zigbee_start_debug_mode();
+    }
+    else if (strcmp(command, "blinds:nodebug") == 0) {
+        ESP_LOGI(TAG_MQTT, "Zigbee: Stopping debug mode...");
+        zigbee_stop_debug_mode();
+    }
+    else if (strcmp(command, "blinds:reset") == 0) {
+        ESP_LOGW(TAG_MQTT, "Zigbee: Clearing all paired devices!");
+        zigbee_devices_clear_all();
+        ESP_LOGI(TAG_MQTT, "All devices cleared. Send 'blinds:pair' to pair again.");
     }
     else if (strncmp(command, "blinds:", 7) == 0) {
         /* blinds:XX where XX is a percentage (0-100) */
@@ -2790,6 +2849,23 @@ void app_main(void)
     ESP_LOGI(TAG, ">>> STEP 1c: Configuring power button...");
     configure_power_button();
     
+    /* Check if BOOT button is held during startup = DEV MODE (skip hardware tests) */
+    static bool s_dev_mode = false;
+    vTaskDelay(100 / portTICK_PERIOD_MS);  /* Brief delay for button debounce */
+    if (is_power_button_pressed()) {
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║  🔧 DEV MODE - BOOT button held at startup               ║");
+        ESP_LOGW(TAG, "║  Skipping LED strip tests and buzzer tests               ║");
+        ESP_LOGW(TAG, "╚══════════════════════════════════════════════════════════╝");
+        ESP_LOGW(TAG, "");
+        s_dev_mode = true;
+        /* Wait for button release */
+        while (is_power_button_pressed()) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+        }
+    }
+    
     /* Step 1d: Initialize potentiometer for brightness control */
     ESP_LOGI(TAG, ">>> STEP 1d: Initializing potentiometer brightness control...");
     init_potentiometer();
@@ -2824,25 +2900,43 @@ void app_main(void)
     ESP_LOGI(TAG, "║     BOOTING UP - Starting full initialization            ║");
     ESP_LOGI(TAG, "╚══════════════════════════════════════════════════════════╝");
     
-    /* Play startup melody */
-    buzzer_startup();
-    
-    /* Step 1: Solid white for 1 second */
-    ESP_LOGI(TAG, ">>> STARTUP: Solid white for 1 second...");
-    jump_to_color(255, 255, 255);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    
-    /* Step 2: Fade to black */
-    ESP_LOGI(TAG, ">>> STARTUP: Fading to black...");
-    fade_to_color(0, 0, 0, 500);
+    if (!s_dev_mode) {
+        /* Play startup melody */
+        buzzer_startup();
+        
+        /* Step 1: Solid white for 1 second */
+        ESP_LOGI(TAG, ">>> STARTUP: Solid white for 1 second...");
+        jump_to_color(255, 255, 255);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        
+        /* Step 2: Fade to black */
+        ESP_LOGI(TAG, ">>> STARTUP: Fading to black...");
+        fade_to_color(0, 0, 0, 500);
+    }
 
     /* ========================================================================
        WIFI CONNECTION + LED STRIP TEST
        - Onboard LED: Breathing light blue while connecting
        - LED Strip: RGB scan (R, then G, then B), then white breathing
        ======================================================================== */
-    ESP_LOGI(TAG, ">>> STEP 2: Connecting to WiFi + Testing LED strip...");
+    ESP_LOGI(TAG, ">>> STEP 2: Connecting to WiFi%s...", s_dev_mode ? "" : " + Testing LED strip");
     wifi_init_start();
+    
+    /* DEV MODE: Fast path - just wait for WiFi without hardware tests */
+    if (s_dev_mode) {
+        ESP_LOGI(TAG, "    (Dev mode: waiting for WiFi only, no hardware tests)");
+        int wifi_status = 0;
+        while (wifi_status == 0) {
+            wifi_status = wifi_check_status();
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+        if (wifi_status == 1) {
+            ESP_LOGI(TAG, ">>> WiFi CONNECTED!");
+        } else {
+            ESP_LOGE(TAG, ">>> WiFi FAILED!");
+        }
+        goto wifi_done;
+    }
 
     /* Light blue color for WiFi connecting (soft sky blue) - max 50% brightness = 127 */
     const uint8_t wifi_max_r = 50;
@@ -3082,11 +3176,14 @@ void app_main(void)
     }
     ESP_LOGI(TAG, ">>> STARTUP SEQUENCE COMPLETE");
 
+wifi_done:  /* Label for dev mode fast path to skip hardware tests */
     /* Show result with smooth fade */
-    if (wifi_status == 1) {
-        ESP_LOGI(TAG, ">>> WiFi CONNECTED! Fading to solid blue...");
-        buzzer_chime_up();  /* Success chime! */
-        fade_to_color(0, 0, 255, 800);  /* Fade to 100% blue */
+    if (wifi_check_status() == 1) {
+        ESP_LOGI(TAG, ">>> WiFi CONNECTED!%s", s_dev_mode ? "" : " Fading to solid blue...");
+        if (!s_dev_mode) {
+            buzzer_chime_up();  /* Success chime! */
+            fade_to_color(0, 0, 255, 800);  /* Fade to 100% blue */
+        }
         
         /* Start MQTT connection to Adafruit IO */
         ESP_LOGI(TAG, ">>> STEP 3: Starting MQTT connection...");
@@ -3187,10 +3284,12 @@ void app_main(void)
             ESP_LOGE(TAG, ">>> Zigbee Hub failed to start: %s", esp_err_to_name(zb_err));
         }
     } else {
-        ESP_LOGE(TAG, ">>> WiFi FAILED! Fading to blinking red...");
+        ESP_LOGE(TAG, ">>> WiFi FAILED!%s", s_dev_mode ? "" : " Fading to blinking red...");
         ESP_LOGI(TAG, ">>> Press BOOT button to enter standby mode");
-        buzzer_error();  /* Error beeps! */
-        fade_to_color(255, 0, 0, 500);  /* Fade to 100% red */
+        if (!s_dev_mode) {
+            buzzer_error();  /* Error beeps! */
+            fade_to_color(255, 0, 0, 500);  /* Fade to 100% red */
+        }
         
         /* Blink red on/off - but check for power button to allow standby */
         while (1) {
@@ -3225,6 +3324,9 @@ void app_main(void)
     
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> ENTERING MAIN ANIMATION LOOP");
+    
+    /* Debug mode disabled - use MQTT "blinds:debug" to enable if needed */
+    // zigbee_start_debug_mode();
     
     /* Animation state */
     float head_position = 0.0f;      /* For meteor animation */
@@ -3337,8 +3439,8 @@ void app_main(void)
                 if (cycle_timer_ms >= cycle_interval_ms) {
                     cycle_timer_ms = 0;
                     cycle_anim_index = (cycle_anim_index + 1) % 4;
-                    const char* anim_names[] = {"FUSION", "WAVE", "TETRIS", "STARS"};
-                    ESP_LOGI(TAG, "Cycle: switching to %s", anim_names[cycle_anim_index]);
+                    // const char* anim_names[] = {"FUSION", "WAVE", "TETRIS", "STARS"};
+                    // ESP_LOGI(TAG, "Cycle: switching to %s", anim_names[cycle_anim_index]);  // Commented for Zigbee debug
                 }
                 
                 /* Track previous index for reset logic */
