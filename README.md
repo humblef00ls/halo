@@ -247,18 +247,18 @@ Built with ESP-IDF v5.5 (not Arduino). Uses:
 
 Say these through Google Home (via IFTTT → Adafruit IO → MQTT):
 
-| Command                                           | What it does                     |
-| ------------------------------------------------- | -------------------------------- |
-| `cycle`                                           | Auto-switches between animations |
-| `fusion` / `wave` / `meteor` / `stars` / `tetris` | Pick an animation                |
-| `rainbow` / `breathing` / `solid`                 | Classic modes                    |
-| `off` / `on`                                      | Power control                    |
-| `slow` / `medium` / `fast`                        | Animation speed                  |
-| `red` / `blue` / `purple` / `white` / `warm`      | Named colors                     |
-| `blinds:open` / `blinds:close` / `blinds:stop`    | Zigbee blind control             |
-| `blinds:50` (any number 0-100)                    | Move blinds to percentage        |
+| Command                                           | What it does                        |
+| ------------------------------------------------- | ----------------------------------- |
+| `cycle`                                           | Auto-switches between animations    |
+| `fusion` / `wave` / `meteor` / `stars` / `tetris` | Pick an animation                   |
+| `rainbow` / `breathing` / `solid`                 | Classic modes                       |
+| `off` / `on`                                      | Power control                       |
+| `slow` / `medium` / `fast`                        | Animation speed                     |
+| `red` / `blue` / `purple` / `white` / `warm`      | Named colors                        |
+| `blinds:open` / `blinds:close` / `blinds:stop`    | Zigbee blind control                |
+| `blinds:50` (any number 0-100)                    | Move blinds to percentage           |
 | `blinds:status` / `blinds:query`                  | Debug: show paired devices/position |
-| `blinds:reset`                                    | Clear all paired Zigbee devices  |
+| `blinds:reset`                                    | Clear all paired Zigbee devices     |
 
 ---
 
@@ -373,23 +373,24 @@ The Zigbee coordinator runs on the ESP32-C6's built-in 802.15.4 radio. It forms 
 - This is a Tuya device behavior, not a bug in our code
 
 **Signs the blind needs waking:**
+
 - Commands are sent but blind doesn't move
 - No "Received TO_CLI custom command" errors in logs
 - Status shows device as "ONLINE" but it's actually sleeping
 
 ### MQTT Commands
 
-| Command | What it does |
-| --- | --- |
-| `blinds:open` | Open the blinds (0% = fully open) |
-| `blinds:close` | Close the blinds (100% = fully closed) |
-| `blinds:stop` | Stop movement |
-| `blinds:50` | Move to 50% position (any number 0-100) |
-| `blinds:status` | Print network status and paired devices |
-| `blinds:query` | Query current blind position |
-| `blinds:debug` | Start periodic position queries (every 5s) |
-| `blinds:nodebug` | Stop periodic queries |
-| `blinds:reset` | Clear all paired devices from NVS |
+| Command          | What it does                               |
+| ---------------- | ------------------------------------------ |
+| `blinds:open`    | Open the blinds (0% = fully open)          |
+| `blinds:close`   | Close the blinds (100% = fully closed)     |
+| `blinds:stop`    | Stop movement                              |
+| `blinds:50`      | Move to 50% position (any number 0-100)    |
+| `blinds:status`  | Print network status and paired devices    |
+| `blinds:query`   | Query current blind position               |
+| `blinds:debug`   | Start periodic position queries (every 5s) |
+| `blinds:nodebug` | Stop periodic queries                      |
+| `blinds:reset`   | Clear all paired devices from NVS          |
 
 ### Tuya Private Cluster (0xEF00)
 
@@ -398,6 +399,7 @@ The Zigbee coordinator runs on the ESP32-C6's built-in 802.15.4 radio. It forms 
 Standard ZCL Window Covering cluster (`0x0102`) won't work. The code detects Tuya devices by checking for `0xEF00` in the cluster list and registers them as `ZIGBEE_DEVICE_TYPE_TUYA_BLIND`.
 
 **Tuya DP IDs for blinds:**
+
 - `0x01` - Control (0=open, 1=stop, 2=close) — **Note: open/close are inverted from what you'd expect!**
 - `0x02` - Percent position (0-100)
 - `0x03` - Percent control (set position)
@@ -405,6 +407,7 @@ Standard ZCL Window Covering cluster (`0x0102`) won't work. The code detects Tuy
 - `0x07` - Work state
 
 **Command inversion:** The physical open/close directions were backwards, so the code swaps them:
+
 ```c
 #define TUYA_BLIND_OPEN   0x02  // Tuya calls this "close" but it physically opens
 #define TUYA_BLIND_CLOSE  0x00  // Tuya calls this "open" but it physically closes
@@ -442,28 +445,44 @@ If WiFi becomes flaky when Zigbee is active (or vice versa), this is expected be
 
 ---
 
-## Future Plans
+## Roadmap
 
-### Halo Hub (ESP32-C6)
+### ✅ Phase 1: LED Control
 
+- [x] 45-pixel RGBW LED ring with animations
+- [x] MQTT control via Adafruit IO
+- [x] Voice commands via IFTTT + Google Assistant
+- [x] Potentiometer brightness control
+- [x] Buzzer feedback and melodies
+
+### ✅ Phase 2: Zigbee Smart Home
+
+- [x] ESP32-C6 as Zigbee coordinator
+- [x] Tuya/MoES blind control (0xEF00 cluster)
+- [x] Device persistence in NVS
+- [x] Auto-reconnect on boot
+- [x] Dev mode (hold BOOT to skip hardware tests)
+
+### 🔄 Phase 3: Native Google Home (In Progress)
+
+- [ ] Google Smart Home API integration
+- [ ] Register LED ring as native light device
+- [ ] Register blinds as native blinds device
+- [ ] Natural voice: "Hey Google, make it purple"
+
+### 📋 Phase 4: Display & Sensors
+
+- [ ] Charlieplex LED matrix display
+- [ ] Stock ticker / weather / notifications
 - [ ] mmWave presence detection
-- [ ] Charlieplex matrix display
-- [ ] 12V nOOds accent lighting
-- [ ] Rotary encoder + buttons
-- [ ] Battery backup with low power mode
-- [ ] Power loss detection (auto-switch to nightlight mode)
-- [ ] Matter support (native HomeKit/Google Home)
+- [ ] 12V accent lighting
 
-### Angel (XIAO ESP32S3 Sense)
+### 📋 Phase 5: Angel Camera Module
 
-- [ ] Camera integration with Halo
+- [ ] XIAO ESP32S3 Sense integration
+- [ ] Presence-triggered photo capture
 - [ ] AI face recognition + stranger alerts
-- [ ] Photo capture on presence detection
-- [ ] Cloud upload (Google Cloud Storage or similar)
-- [ ] Live video streaming (MJPEG)
-- [ ] Voice commands via built-in mic + Whisper API
-- [ ] Portable/detachable operation on battery
-- [ ] Backup battery for Halo when main power goes out
+- [ ] Live video streaming
 
 ---
 
@@ -474,6 +493,7 @@ If WiFi becomes flaky when Zigbee is active (or vice versa), this is expected be
 Sometimes the ESP32-C6 WiFi scan returns zero networks even when you're sitting next to the router. This appears to be a hardware/radio initialization issue, not a software bug.
 
 **What the code does:**
+
 1. Scans for networks
 2. If `ap_count == 0` (no networks at all), triggers aggressive retry:
    - Full radio reset: `esp_wifi_stop()` → `esp_wifi_start()`
@@ -482,6 +502,7 @@ Sometimes the ESP32-C6 WiFi scan returns zero networks even when you're sitting 
 3. If still no networks after 3 resets → likely hardware issue or severe interference
 
 **Log output when this happens:**
+
 ```
 W (5947) wifi:   ❌ NO NETWORKS FOUND! Radio may need reset.
 W (5957) wifi: ║  🔄 RADIO RESET RETRY 1/3 - No networks found!
@@ -491,12 +512,14 @@ E (15867) wifi: ║  This may be a hardware issue or severe interference.
 ```
 
 **Possible causes:**
+
 - WiFi/Zigbee coexistence issues (both use 2.4GHz)
 - Bad antenna connection or damaged antenna trace
 - Interference from nearby 2.4GHz devices
 - Cold start timing issues with the radio
 
 **Workarounds:**
+
 - Power cycle the device
 - Check antenna connections
 - Move away from interference sources (microwaves, other 2.4GHz devices)
@@ -518,6 +541,7 @@ The Tuya cluster command API often returns `ESP_FAIL` even when the command was 
 ### Blind Overshoots Physical Limits
 
 If the blind keeps moving after reaching the top/bottom:
+
 - This is a physical device issue, not software
 - You need to set the motor limits on the blind itself
 - Check the blind's manual for limit setting procedure (usually involves holding buttons in a specific sequence)
@@ -526,6 +550,7 @@ If the blind keeps moving after reaching the top/bottom:
 ### Linter Errors in VS Code
 
 The ESP-IDF linter in VS Code often shows false positives like:
+
 - `'sys/reent.h' file not found`
 - Various "undefined" errors for ESP-IDF types
 
@@ -535,4 +560,8 @@ These are IDE configuration issues, not real errors. If `idf.py build` succeeds,
 
 ## License
 
-Do whatever you want with this. It's just a cool light that got out of hand.
+**PolyForm Noncommercial License 1.0.0**
+
+This project is free for personal, educational, and non-commercial use. Commercial use is prohibited without explicit permission.
+
+See [LICENSE](LICENSE) for full terms.
