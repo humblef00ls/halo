@@ -42,7 +42,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "mqtt_client.h"
-#include "esp_adc/adc_oneshot.h"
+#include "rotary_encoder.h"  /* Rotary encoder for brightness control */
 #include "driver/ledc.h"  /* PWM for passive buzzer */
 #include "esp_random.h"   /* For esp_random() in song selection */
 #include "esp_system.h"   /* For esp_get_free_heap_size(), chip info */
@@ -51,6 +51,7 @@
 #include "credentials.h"  /* WiFi and Adafruit IO credentials (gitignored) */
 #include "zigbee_hub.h"   /* Zigbee coordinator for blind control */
 #include "zigbee_devices.h" /* Zigbee device storage */
+#include "matter_devices.h" /* Matter smart home (Google Home, Apple HomeKit, Alexa) */
 
 /* Logging tags for different components */
 static const char *TAG = "main";
@@ -94,30 +95,38 @@ static const char *TAG_MQTT = "mqtt";
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 
 /* ============================================================================
-   POTENTIOMETER BRIGHTNESS CONTROL
+   ROTARY ENCODER BRIGHTNESS CONTROL
    ============================================================================
-   A 10kΩ potentiometer on GPIO1 (ADC1_CH1) provides real-time brightness control.
-   Wiring: Left pin → GND, Middle pin → GPIO1, Right pin → 3.3V
+   A rotary encoder on GPIO 19/21/22 provides brightness control.
+   Wiring (from README.md):
+     CLK (A)  → GPIO 19
+     DT (B)   → GPIO 21
+     SW       → GPIO 22
+     +        → 3.3V
+     GND      → GND
+   
+   Behavior:
+     - Rotate clockwise: increase brightness by 5%
+     - Rotate counter-clockwise: decrease brightness by 5%
+     - Short press: toggle LED on/off
+     - Long press (>1s): cycle to next animation
    ============================================================================ */
 
-#define POT_GPIO            GPIO_NUM_1
-#define POT_ADC_CHANNEL     ADC_CHANNEL_1
-#define POT_ADC_UNIT        ADC_UNIT_1
+static const char *TAG_ENCODER = "encoder_ctrl";
 
-static const char *TAG_POT = "potentiometer";
-static adc_oneshot_unit_handle_t pot_adc_handle = NULL;
+/* Encoder-controlled brightness (0.20 to 1.0) */
+static volatile float encoder_brightness = 0.5f;
 
-/* Pot brightness multiplier (0.05 to 1.0) - updated by reading pot
-   Default to 0.5 (50%) in case potentiometer is not connected */
-static volatile float pot_brightness = 0.5f;
-
-/* Software brightness override (0.0 = use pot, 0.01-1.0 = override value)
+/* Software brightness override (0.0 = use encoder, 0.01-1.0 = override value)
    Set via MQTT "brightness:XX" command where XX is 0-100 percent */
 static volatile float software_brightness = 0.0f;
 
-/* Get effective brightness - uses software override if set, else potentiometer */
+/* Brightness step per encoder click (5%) */
+#define ENCODER_BRIGHTNESS_STEP 0.05f
+
+/* Get effective brightness - uses software override if set, else encoder */
 static inline float get_effective_brightness(void) {
-    return (software_brightness > 0.0f) ? software_brightness : pot_brightness;
+    return (software_brightness > 0.0f) ? software_brightness : encoder_brightness;
 }
 
 /* ============================================================================
@@ -331,109 +340,155 @@ static void increment_rotation_count(void)
 }
 
 /* ============================================================================
-   POTENTIOMETER FUNCTIONS
+   ROTARY ENCODER FUNCTIONS
    ============================================================================ */
 
-/* Initialize the potentiometer ADC */
-static void init_potentiometer(void)
+/* Encoder modes: control LED brightness or Zigbee blinds position */
+typedef enum {
+    ENCODER_MODE_LED,      /* Default: control LED brightness */
+    ENCODER_MODE_BLINDS,   /* Control Zigbee blinds position */
+} encoder_mode_t;
+
+static encoder_mode_t encoder_mode = ENCODER_MODE_LED;
+
+/* Track encoder changes for brightness/blinds gauge display */
+static float encoder_prev_brightness = 0.5f;
+static int encoder_idle_frames = 999;  /* Frames since last change (start high to skip gauge on boot) */
+static const int ENCODER_GAUGE_TIMEOUT = 90;  /* Show gauge for ~1.5 seconds after last change (60fps) */
+
+/* Blinds position controlled by encoder (0-100%) */
+static int encoder_blinds_position = 50;  /* Start at 50% */
+#define BLINDS_POSITION_STEP 1  /* 1% per click - fine control, ~100 turns for full range */
+
+/* Forward declaration for buzzer function */
+static void buzzer_beep(uint16_t frequency_hz, uint16_t duration_ms);
+
+/* Play triple beep for mode switch feedback */
+static void buzzer_triple_beep(void)
 {
-    ESP_LOGI(TAG_POT, "Initializing potentiometer on GPIO%d...", POT_GPIO);
-    
-    /* Configure ADC unit */
-    adc_oneshot_unit_init_cfg_t init_config = {
-        .unit_id = POT_ADC_UNIT,
-        .ulp_mode = ADC_ULP_MODE_DISABLE,
-    };
-    esp_err_t ret = adc_oneshot_new_unit(&init_config, &pot_adc_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG_POT, "Failed to initialize ADC unit: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    /* Configure the ADC channel */
-    adc_oneshot_chan_cfg_t chan_config = {
-        .bitwidth = ADC_BITWIDTH_12,   /* 0-4095 range */
-        .atten = ADC_ATTEN_DB_12,      /* Full 0-3.3V range */
-    };
-    ret = adc_oneshot_config_channel(pot_adc_handle, POT_ADC_CHANNEL, &chan_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG_POT, "Failed to configure ADC channel: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    ESP_LOGI(TAG_POT, "Potentiometer initialized successfully");
+    buzzer_beep(1000, 80);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    buzzer_beep(1000, 80);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    buzzer_beep(1500, 120);  /* Higher pitch on third beep */
 }
 
-/* Read the potentiometer and update pot_brightness (call periodically)
-   Returns brightness value from 0.05 (min, so LEDs never fully off) to 0.95 (max) */
-static float read_potentiometer(void)
+/* Process encoder events and update brightness or blinds
+   Returns true if value changed (gauge should show) */
+static bool process_encoder_events(void)
 {
-    if (pot_adc_handle == NULL) {
-        return 0.5f;  /* Default to 50% brightness if not initialized */
+    bool changed = false;
+    encoder_event_t event;
+    
+    /* Process all pending encoder events */
+    while ((event = encoder_poll_event()) != ENCODER_EVENT_NONE) {
+        switch (event) {
+            case ENCODER_EVENT_DOUBLE_TAP:
+                /* Double-tap: switch between LED and Blinds mode */
+                if (encoder_mode == ENCODER_MODE_LED) {
+                    encoder_mode = ENCODER_MODE_BLINDS;
+                    ESP_LOGI(TAG_ENCODER, "");
+                    ESP_LOGI(TAG_ENCODER, "╔═══════════════════════════════════╗");
+                    ESP_LOGI(TAG_ENCODER, "║  🪟 BLINDS CONTROL MODE            ║");
+                    ESP_LOGI(TAG_ENCODER, "╚═══════════════════════════════════╝");
+                    ESP_LOGI(TAG_ENCODER, "  Rotate to move blinds up/down");
+                    ESP_LOGI(TAG_ENCODER, "  Double-tap to return to LED mode");
+                    buzzer_triple_beep();
+                } else {
+                    encoder_mode = ENCODER_MODE_LED;
+                    ESP_LOGI(TAG_ENCODER, "");
+                    ESP_LOGI(TAG_ENCODER, "╔═══════════════════════════════════╗");
+                    ESP_LOGI(TAG_ENCODER, "║  💡 LED BRIGHTNESS MODE            ║");
+                    ESP_LOGI(TAG_ENCODER, "╚═══════════════════════════════════╝");
+                    ESP_LOGI(TAG_ENCODER, "  Rotate to adjust brightness");
+                    buzzer_beep(800, 100);  /* Single low beep for LED mode */
+                }
+                break;
+                
+            case ENCODER_EVENT_CW:
+                if (encoder_mode == ENCODER_MODE_LED) {
+                    /* LED mode: increase brightness */
+                    encoder_brightness += ENCODER_BRIGHTNESS_STEP;
+                    if (encoder_brightness > 1.0f) encoder_brightness = 1.0f;
+                    software_brightness = 0.0f;  /* Clear software override, use encoder */
+                    ESP_LOGI(TAG_ENCODER, "Brightness +5%%: %.0f%%", encoder_brightness * 100);
+                } else {
+                    /* Blinds mode: open blinds (increase position) */
+                    encoder_blinds_position += BLINDS_POSITION_STEP;
+                    if (encoder_blinds_position > 100) encoder_blinds_position = 100;
+                    ESP_LOGI(TAG_ENCODER, "Blinds → OPEN: %d%%", encoder_blinds_position);
+                    zigbee_blind_set_position(0, (uint8_t)encoder_blinds_position);
+                }
+                changed = true;
+                break;
+                
+            case ENCODER_EVENT_CCW:
+                if (encoder_mode == ENCODER_MODE_LED) {
+                    /* LED mode: decrease brightness */
+                    encoder_brightness -= ENCODER_BRIGHTNESS_STEP;
+                    if (encoder_brightness < 0.20f) encoder_brightness = 0.20f;  /* Min 20% */
+                    software_brightness = 0.0f;  /* Clear software override, use encoder */
+                    ESP_LOGI(TAG_ENCODER, "Brightness -5%%: %.0f%%", encoder_brightness * 100);
+                } else {
+                    /* Blinds mode: close blinds (decrease position) */
+                    encoder_blinds_position -= BLINDS_POSITION_STEP;
+                    if (encoder_blinds_position < 0) encoder_blinds_position = 0;
+                    ESP_LOGI(TAG_ENCODER, "Blinds → CLOSE: %d%%", encoder_blinds_position);
+                    zigbee_blind_set_position(0, (uint8_t)encoder_blinds_position);
+                }
+                changed = true;
+                break;
+                
+            case ENCODER_EVENT_PRESS:
+                /* Short press: toggle on/off (LED mode) or stop blinds (blinds mode) */
+                if (encoder_mode == ENCODER_MODE_LED) {
+                    if (current_animation == ANIM_OFF) {
+                        current_animation = ANIM_CYCLE;
+                        ESP_LOGI(TAG_ENCODER, "LED: ON (cycle mode)");
+                    } else {
+                        current_animation = ANIM_OFF;
+                        ESP_LOGI(TAG_ENCODER, "LED: OFF");
+                    }
+                } else {
+                    /* In blinds mode, single press stops the blinds */
+                    ESP_LOGI(TAG_ENCODER, "Blinds: STOP");
+                    zigbee_blind_stop(0);
+                }
+                break;
+                
+            case ENCODER_EVENT_LONG_PRESS:
+                /* Long press: cycle to next animation (only in LED mode) */
+                if (encoder_mode == ENCODER_MODE_LED) {
+                    static const animation_mode_t anim_cycle[] = {
+                        ANIM_CYCLE, ANIM_SOLID, ANIM_RAINBOW, ANIM_BREATHING, 
+                        ANIM_METEOR, ANIM_WAVE, ANIM_STARS
+                    };
+                    static int anim_index = 0;
+                    anim_index = (anim_index + 1) % (sizeof(anim_cycle) / sizeof(anim_cycle[0]));
+                    current_animation = anim_cycle[anim_index];
+                    ESP_LOGI(TAG_ENCODER, "Animation: %d", current_animation);
+                }
+                break;
+                
+            default:
+                break;
+        }
     }
     
-    int raw_value = 0;
-    esp_err_t ret = adc_oneshot_read(pot_adc_handle, POT_ADC_CHANNEL, &raw_value);
-    if (ret != ESP_OK) {
-        return pot_brightness;  /* Keep last value on error */
-    }
-    
-    /* Potentiometers often don't reach exact 0 or 4095 in practice.
-       Use aggressive dead zones to ensure we can hit 0% and 100% */
-    const int ADC_MIN_DEADZONE = 50;    /* Below this = 0% */
-    const int ADC_MAX_DEADZONE = 3300;  /* Above this = 100% (lowered for real-world pots) */
-    
-    float raw_brightness;
-    if (raw_value <= ADC_MIN_DEADZONE) {
-        raw_brightness = 0.0f;
-    } else if (raw_value >= ADC_MAX_DEADZONE) {
-        raw_brightness = 1.0f;
-    } else {
-        /* Scale the middle range to 0.0-1.0 */
-        raw_brightness = (float)(raw_value - ADC_MIN_DEADZONE) / 
-                         (float)(ADC_MAX_DEADZONE - ADC_MIN_DEADZONE);
-    }
-    
-    /* Map 0.0-1.0 to brightness range: 5% minimum, 100% maximum (no artificial cap!) */
-    const float min_brightness = 0.05f;  /* 5% minimum */
-    const float max_brightness = 1.00f;  /* 100% maximum - full brightness available */
-    float new_brightness = min_brightness + raw_brightness * (max_brightness - min_brightness);
-    
-    /* Lighter smoothing so we can reach extremes faster */
-    pot_brightness = pot_brightness * 0.5f + new_brightness * 0.5f;
-    
-    /* Clamp to ensure we stay in bounds */
-    if (pot_brightness < min_brightness) pot_brightness = min_brightness;
-    if (pot_brightness > max_brightness) pot_brightness = max_brightness;
-    
-    /* Only log when brightness changes significantly (>2% change) */
-    static float last_logged_brightness = -1.0f;
-    if (fabsf(pot_brightness - last_logged_brightness) > 0.02f) {
-        last_logged_brightness = pot_brightness;
-        ESP_LOGI(TAG_POT, "Brightness changed to %.0f%%", pot_brightness * 100);
-    }
-    
-    return pot_brightness;
+    return changed;
 }
 
-/* Track pot changes for brightness gauge display */
-static float pot_prev_value = 0.5f;
-static int pot_idle_frames = 999;  /* Frames since last pot change (start high to skip gauge on boot) */
-static const int POT_GAUGE_TIMEOUT = 90;  /* Show gauge for ~1.5 seconds after last change (60fps) */
-
-/* Check if pot is being adjusted (returns true if gauge should show) */
-static bool is_pot_adjusting(void)
+/* Check if encoder was recently adjusted (returns true if gauge should show) */
+static bool is_encoder_adjusting(void)
 {
-    float diff = fabsf(pot_brightness - pot_prev_value);
-    
-    if (diff > 0.01f) {  /* Pot moved more than 1% */
-        pot_idle_frames = 0;
-        pot_prev_value = pot_brightness;
+    if (process_encoder_events()) {
+        encoder_idle_frames = 0;
+        encoder_prev_brightness = encoder_brightness;
     } else {
-        pot_idle_frames++;
+        encoder_idle_frames++;
     }
     
-    return (pot_idle_frames < POT_GAUGE_TIMEOUT);
+    return (encoder_idle_frames < ENCODER_GAUGE_TIMEOUT);
 }
 
 /* ============================================================================
@@ -476,7 +531,7 @@ static void log_system_metrics(void)
     //          zigbee_is_network_ready() ? "ready" : "not ready",
     //          zigbee_get_device_count());
     // ESP_LOGI(TAG_METRICS, "Animation: mode %d, speed %.2f, brightness %.0f%%",
-    //          current_animation, animation_speed, pot_brightness * 100);
+    //          current_animation, animation_speed, encoder_brightness * 100);
     (void)uptime_hrs; (void)uptime_min; (void)uptime_sec;  /* Suppress unused warnings */
     (void)free_heap; (void)min_free_heap; (void)free_internal;
 }
@@ -1354,11 +1409,16 @@ static void handle_mqtt_command(const char *data, int data_len)
         } else if (strcmp(effect, "fusion") == 0 || strcmp(effect, "blend") == 0) {
             current_animation = ANIM_FUSION;
         } else if (strcmp(effect, "fire") == 0 || strcmp(effect, "flame") == 0 || strcmp(effect, "flames") == 0) {
-            current_animation = ANIM_FIRE;
+            /* Map fire to warm meteor effect */
+            strip_color_r = 255; strip_color_g = 100; strip_color_b = 0; strip_color_w = 0;
+            current_animation = ANIM_METEOR;
         } else if (strcmp(effect, "candle") == 0 || strcmp(effect, "candlelight") == 0 || strcmp(effect, "flicker") == 0) {
-            current_animation = ANIM_CANDLE;
+            /* Map candle to warm breathing effect */
+            strip_color_r = 255; strip_color_g = 150; strip_color_b = 50; strip_color_w = 50;
+            current_animation = ANIM_BREATHING;
         } else if (strcmp(effect, "chill") == 0 || strcmp(effect, "relaxing") == 0 || strcmp(effect, "calm") == 0) {
-            current_animation = ANIM_CHILL;
+            /* Map chill to slow wave effect */
+            current_animation = ANIM_WAVE;
         } else if (strcmp(effect, "stars") == 0 || strcmp(effect, "twinkle") == 0) {
             current_animation = ANIM_STARS;
         } else if (strcmp(effect, "shower") == 0) {
@@ -1513,6 +1573,135 @@ static void mqtt_init(void)
     esp_mqtt_client_start(mqtt_client);
     
     ESP_LOGI(TAG_MQTT, "MQTT client started, connecting...");
+}
+
+/* ============================================================================
+   MATTER CALLBACKS
+   ============================================================================
+   These callbacks are invoked when Matter (Google Home/Apple HomeKit/Alexa)
+   sends commands. They interface with the existing LED and Zigbee control.
+   ============================================================================ */
+
+static void matter_on_light_on_off(bool on)
+{
+    ESP_LOGI(TAG, "[Matter] Light On/Off: %s", on ? "ON" : "OFF");
+    if (on) {
+        /* Turn on - go to cycle mode */
+        current_animation = ANIM_CYCLE;
+    } else {
+        /* Turn off */
+        current_animation = ANIM_OFF;
+    }
+}
+
+static void matter_on_light_brightness(uint8_t brightness)
+{
+    ESP_LOGI(TAG, "[Matter] Light Brightness: %d%%", brightness);
+    if (brightness == 0) {
+        current_animation = ANIM_OFF;
+        software_brightness = 0.0f;
+    } else {
+        software_brightness = (float)brightness / 100.0f;
+        /* No minimum for Matter - user can set any value via voice/app */
+        if (current_animation == ANIM_OFF) {
+            current_animation = ANIM_SOLID;
+        }
+    }
+}
+
+static void matter_on_light_color(uint8_t r, uint8_t g, uint8_t b)
+{
+    ESP_LOGI(TAG, "[Matter] Light Color (RGB mode): R=%d G=%d B=%d", r, g, b);
+    strip_color_r = r;
+    strip_color_g = g;
+    strip_color_b = b;
+    strip_color_w = 0;  /* RGB mode - turn OFF white channel */
+    current_animation = ANIM_SOLID;
+}
+
+/* Color temperature callback - used for white mode on RGBW lights
+ * mireds: 153 = cool/daylight (6500K), 370 = warm white (2700K), 500 = very warm (2000K)
+ */
+static void matter_on_light_color_temp(uint16_t mireds)
+{
+    /* Convert mireds to Kelvin for logging */
+    uint32_t kelvin = (mireds > 0) ? (1000000 / mireds) : 6500;
+    
+    ESP_LOGI(TAG, "[Matter] Light Color Temp (White mode): %d mireds (~%luK)", mireds, (unsigned long)kelvin);
+    
+    /* For RGBW: Turn OFF RGB, use only White channel
+     * We could blend warm/cool white based on mireds if we had separate WW/CW LEDs,
+     * but for a single W channel, we just use full white at current brightness */
+    strip_color_r = 0;
+    strip_color_g = 0;
+    strip_color_b = 0;
+    
+    /* Use current brightness for white channel 
+     * The brightness is already set via the light_brightness callback */
+    strip_color_w = 255;  /* Full white - brightness is controlled separately */
+    
+    current_animation = ANIM_SOLID;
+}
+
+static void matter_on_blinds_position(uint8_t position)
+{
+    /* IMPORTANT: Matter uses INVERTED position values!
+     * Matter 0% = Fully OPEN (lift at top)
+     * Matter 100% = Fully CLOSED (lift at bottom)
+     * Our Tuya blind uses the opposite convention, so we invert. */
+    uint8_t tuya_position = 100 - position;
+    
+    ESP_LOGI(TAG, "[Matter] Blinds Position: %d%% (Matter) → %d%% (Tuya)", position, tuya_position);
+    
+    if (tuya_position == 100) {
+        zigbee_blind_open(0);    /* Fully open */
+    } else if (tuya_position == 0) {
+        zigbee_blind_close(0);   /* Fully closed */
+    } else {
+        zigbee_blind_set_position(0, tuya_position);
+    }
+}
+
+static void matter_on_blinds_stop(void)
+{
+    ESP_LOGI(TAG, "[Matter] Blinds Stop");
+    zigbee_blind_stop(0);
+}
+
+/* Initialize Matter smart home integration 
+ * Returns true if successful, false otherwise.
+ * Boot sequence continues either way - Matter is optional. */
+static bool matter_init(void)
+{
+    ESP_LOGI(TAG, "Initializing Matter smart home...");
+    
+    /* IMPORTANT: Must be static! This struct is stored by pointer in matter_devices.cpp,
+     * so it must persist after this function returns. */
+    static matter_callbacks_t callbacks = {
+        .light_on_off = matter_on_light_on_off,
+        .light_brightness = matter_on_light_brightness,
+        .light_color = matter_on_light_color,
+        .light_color_temp = matter_on_light_color_temp,  /* For "warm white" / "cool white" commands */
+        .blinds_position = matter_on_blinds_position,
+        .blinds_stop = matter_on_blinds_stop,
+    };
+    
+    esp_err_t err = matter_devices_init(&callbacks);
+    if (err == ESP_OK) {
+        matter_start_commissioning();
+        ESP_LOGI(TAG, ">>> Matter ready! Device can be paired with Google Home/Apple HomeKit/Alexa");
+        return true;
+    } else {
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔══════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║  ⚠️  MATTER UNAVAILABLE                                   ║");
+        ESP_LOGW(TAG, "║  Error: %-48s ║", esp_err_to_name(err));
+        ESP_LOGW(TAG, "║  Google Home/Apple HomeKit pairing will not work.        ║");
+        ESP_LOGW(TAG, "║  LED control, Zigbee, and MQTT will still work.          ║");
+        ESP_LOGW(TAG, "╚══════════════════════════════════════════════════════════╝");
+        ESP_LOGW(TAG, "");
+        return false;
+    }
 }
 
 /* Use project configuration menu (idf.py menuconfig) to choose the GPIO to blink,
@@ -1821,11 +2010,11 @@ static void draw_brightness_gauge(void)
 /* Gamma correction for perceptually smooth brightness falloff */
 #define GAMMA 2.2f
 
-/* Master brightness is controlled by potentiometer OR software override
-   - Pot at min (0V): 5% brightness
-   - Pot at max (3.3V): 100% brightness
-   - Software override (via MQTT brightness:XX) takes precedence
-   Returns 0.05 to 1.0 */
+/* Master brightness is controlled by rotary encoder OR software override
+   - Rotate CCW: decrease brightness (min 20%)
+   - Rotate CW: increase brightness (max 100%)
+   - Software override (via MQTT/Matter brightness) takes precedence
+   Returns 0.20 to 1.0 */
 static float get_master_brightness(void)
 {
     return get_effective_brightness();  /* Uses software override if set */
@@ -2936,13 +3125,18 @@ void app_main(void)
         }
     }
     
-    /* Step 1d: Initialize potentiometer for brightness control */
-    ESP_LOGI(TAG, ">>> STEP 1d: Initializing potentiometer brightness control...");
-    init_potentiometer();
+    /* Step 1d: Initialize rotary encoder for brightness control */
+    ESP_LOGI(TAG, ">>> STEP 1d: Initializing rotary encoder brightness control...");
+    encoder_init();
     
     /* Step 1e: Initialize buzzer */
     ESP_LOGI(TAG, ">>> STEP 1e: Initializing passive buzzer...");
     init_buzzer();
+    
+    /* FORCED TEST BEEP - should always sound regardless of dev mode */
+    ESP_LOGW(TAG, ">>> BUZZER TEST: You should hear a beep NOW!");
+    buzzer_tone(1000, 200);  /* 1kHz for 200ms */
+    buzzer_stop();
     
     /* Step 1f: Initialize melody task for background playback */
     ESP_LOGI(TAG, ">>> STEP 1f: Starting melody background task...");
@@ -3255,9 +3449,15 @@ wifi_done:  /* Label for dev mode fast path to skip hardware tests */
             fade_to_color(0, 0, 255, 800);  /* Fade to 100% blue */
         }
         
-        /* Start MQTT connection to Adafruit IO */
-        ESP_LOGI(TAG, ">>> STEP 3: Starting MQTT connection...");
+        /* Start MQTT connection to Adafruit IO (for webhook/app control) */
+        ESP_LOGI(TAG, ">>> STEP 3a: Starting MQTT connection...");
         mqtt_init();
+        
+        /* Start Matter smart home (Google Home, Apple HomeKit, Alexa)
+         * This is optional - device works without it */
+        ESP_LOGI(TAG, ">>> STEP 3b: Starting Matter smart home (optional)...");
+        bool matter_ok = matter_init();
+        (void)matter_ok;  /* Result logged internally; boot continues either way */
         
         /* Start Zigbee coordinator for blind control */
         ESP_LOGI(TAG, ">>> STEP 4: Starting Zigbee Hub...");
@@ -3428,7 +3628,8 @@ wifi_done:  /* Label for dev mode fast path to skip hardware tests */
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, ">>> STEP 5: Starting animation loop...");
     ESP_LOGI(TAG, "    - %d pixels in ring", RGBW_LED_COUNT);
-    ESP_LOGI(TAG, "    - Brightness: controlled by potentiometer on GPIO%d (5%% to 100%%)", POT_GPIO);
+    ESP_LOGI(TAG, "    - Brightness: controlled by rotary encoder (GPIO%d/%d) (20%% to 100%%)", 
+             ENCODER_GPIO_A, ENCODER_GPIO_B);
     ESP_LOGI(TAG, "    - Lifetime rotations: %lu", (unsigned long)lifetime_rotations);
     ESP_LOGI(TAG, "    - MQTT: Listening for voice commands on '%s'", MQTT_TOPIC);
     ESP_LOGI(TAG, "");
@@ -3440,14 +3641,14 @@ wifi_done:  /* Label for dev mode fast path to skip hardware tests */
     ESP_LOGI(TAG, "");
 
     while (1) {
-        /* Update brightness from potentiometer (smoothed reading) */
-        read_potentiometer();
+        /* Process rotary encoder events (brightness, on/off, animation changes) */
+        /* Note: Encoder is interrupt-driven, events processed in is_encoder_adjusting() */
         
         /* Log system metrics every 30 seconds */
         log_system_metrics();
         
-        /* Check if pot is being adjusted - show brightness gauge instead of animation */
-        if (is_pot_adjusting()) {
+        /* Check if encoder is being adjusted - show brightness gauge instead of animation */
+        if (is_encoder_adjusting()) {
             draw_brightness_gauge();
             
             /* Still update onboard LED rainbow */

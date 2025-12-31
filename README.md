@@ -119,6 +119,28 @@ Just... a solid color. No animation. Set a color and it stays.
 
 ---
 
+## Physical Controls
+
+### Rotary Encoder
+
+The rotary encoder (GPIO 19/21/18) provides hands-on control:
+
+| Action | Effect |
+|--------|--------|
+| Rotate clockwise | Increase brightness by 5% |
+| Rotate counter-clockwise | Decrease brightness by 5% (min 20%) |
+| Short press | Toggle LED on/off |
+| Long press (>1s) | Cycle to next animation |
+
+When you adjust the encoder, a brightness gauge appears on the LED ring for 1.5 seconds.
+
+### Boot Button (GPIO 9)
+
+- **Short press**: Enter standby mode (LEDs off, low power)
+- **Hold during boot**: Skip hardware tests (dev mode)
+
+---
+
 ## Hardware
 
 ### The Two Boards
@@ -160,7 +182,7 @@ ESP32-C6
 │   └── Button 1, 2, 3
 │
 ├── Rotary Encoder (GPIO 19, 21, 18)
-│   └── A, B, Switch
+│   └── A=CLK, B=DT, Switch (brightness + animation control)
 │
 ├── GPIO 20 → mmWave radar OT2 (presence interrupt)
 │
@@ -238,29 +260,37 @@ Built with ESP-IDF v5.5 (not Arduino). Uses:
 
 - RMT peripheral for NeoPixel timing
 - esp-zigbee-sdk for Zigbee coordinator
-- MQTT via Adafruit IO for voice commands
-- IFTTT to bridge Google Assistant
+- esp-matter for native smart home (Google Home, Apple HomeKit, Amazon Alexa)
+- MQTT via Adafruit IO for webhook/app control
 
 ---
 
 ## Voice Commands
 
-### Via Google Home (Native Smart Home Integration)
+### Via Matter (Native Smart Home)
 
-With native Google Home integration, you get natural voice control:
+Halo uses **Matter** for native smart home control. This works locally (no cloud required) with:
 
-```
-"Hey Google, turn on the Halo"
-"Hey Google, set Halo to 50%"
-"Hey Google, make Halo blue"
-"Hey Google, set Halo to rainbow mode"
-"Hey Google, open the blinds"
-"Hey Google, close the blinds to 30%"
-```
+- **Google Home** - "Hey Google, turn on Halo"
+- **Apple HomeKit** - "Hey Siri, set Halo to blue"
+- **Amazon Alexa** - "Alexa, open the blinds"
 
-See `google-home/SETUP.md` for setup instructions.
+Two Matter devices are exposed:
+1. **Halo Light** - Extended Color Light (on/off, brightness, RGB color)
+2. **Halo Blinds** - Window Covering (open/close/position)
 
-### Via MQTT Commands
+#### Commissioning (First-Time Setup)
+
+1. Build and flash the firmware
+2. Device boots and enters Matter commissioning mode
+3. Open Google Home / Apple Home / Alexa app
+4. Add device → Matter-enabled device
+5. Scan QR code or enter setup code: `12345678`
+6. Device appears in your smart home app!
+
+### Via MQTT Commands (Webhook/App Control)
+
+MQTT provides a webhook-style API for custom apps and automation:
 
 Direct MQTT commands to the `commands` feed:
 
@@ -321,6 +351,8 @@ If WiFi fails, it blinks red. Press the boot button to enter standby mode.
 halo/
 ├── main/
 │   ├── halo.c                 # Halo Hub main code
+│   ├── matter_devices.c/.h    # Matter endpoints (Light + Blinds)
+│   ├── rotary_encoder.c/.h    # Rotary encoder driver
 │   ├── zigbee_hub.c/.h        # Zigbee coordinator
 │   ├── zigbee_devices.c/.h    # Device storage (NVS)
 │   ├── credentials.h          # Your secrets (gitignored)
@@ -471,8 +503,7 @@ If WiFi becomes flaky when Zigbee is active (or vice versa), this is expected be
 
 - [x] 45-pixel RGBW LED ring with animations
 - [x] MQTT control via Adafruit IO
-- [x] Voice commands via IFTTT + Google Assistant
-- [x] Potentiometer brightness control
+- [x] Rotary encoder brightness control (+ button for on/off and animation cycling)
 - [x] Buzzer feedback and melodies
 
 ### ✅ Phase 2: Zigbee Smart Home
@@ -483,17 +514,13 @@ If WiFi becomes flaky when Zigbee is active (or vice versa), this is expected be
 - [x] Auto-reconnect on boot
 - [x] Dev mode (hold BOOT to skip hardware tests)
 
-### 🔄 Phase 3: Native Google Home (In Progress)
+### ✅ Phase 3: Native Smart Home (Matter)
 
-- [x] Google Smart Home API fulfillment (Cloud Function)
-- [x] OAuth2 account linking handler
-- [x] ESP32 MQTT commands for brightness/color/effects
-- [ ] Deploy to Google Cloud
-- [ ] Register LED ring as native light device
-- [ ] Register blinds as native blinds device
-- [ ] Natural voice: "Hey Google, make it purple"
-
-See `google-home/SETUP.md` for deployment instructions.
+- [x] Matter SDK integration (esp-matter)
+- [x] Extended Color Light endpoint (LED ring)
+- [x] Window Covering endpoint (blinds)
+- [x] Works with Google Home, Apple HomeKit, Amazon Alexa
+- [x] Local control (no cloud required)
 
 ### 📋 Phase 4: Display & Sensors
 

@@ -3,3 +3,5 @@ dependencies:
   espressif/esp-zboss-lib: "~1.6.0"    # Zigbee stack (ZBOSS)
   espressif/esp-zigbee-lib: "~1.6.0"   # Zigbee API library
   espressif/mqtt: "*"                   # MQTT client
+  espressif/esp_matter: "^1.4.0"       # Matter SDK for smart home (requires ESP-IDF v5.4.1)
+  espressif/qrcode: "^0.1.0"           # QR code generator for terminal display
