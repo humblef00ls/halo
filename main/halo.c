@@ -111,6 +111,15 @@ static adc_oneshot_unit_handle_t pot_adc_handle = NULL;
    Default to 0.5 (50%) in case potentiometer is not connected */
 static volatile float pot_brightness = 0.5f;
 
+/* Software brightness override (0.0 = use pot, 0.01-1.0 = override value)
+   Set via MQTT "brightness:XX" command where XX is 0-100 percent */
+static volatile float software_brightness = 0.0f;
+
+/* Get effective brightness - uses software override if set, else potentiometer */
+static inline float get_effective_brightness(void) {
+    return (software_brightness > 0.0f) ? software_brightness : pot_brightness;
+}
+
 /* ============================================================================
    PASSIVE BUZZER (MELODY PLAYER)
    ============================================================================
@@ -1301,6 +1310,66 @@ static void handle_mqtt_command(const char *data, int data_len)
         ESP_LOGI(TAG_MQTT, "Color: WARM WHITE");
     }
     /* ========================================================================
+       BRIGHTNESS CONTROL (for Google Home integration)
+       ======================================================================== */
+    else if (strncmp(command, "brightness:", 11) == 0) {
+        int percent = atoi(command + 11);
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        
+        if (percent == 0) {
+            /* 0% = turn off */
+            current_animation = ANIM_OFF;
+            software_brightness = 0.0f;
+            ESP_LOGI(TAG_MQTT, "Brightness: OFF (0%%)");
+        } else {
+            /* Set software brightness override */
+            software_brightness = (float)percent / 100.0f;
+            /* Ensure minimum visible brightness */
+            if (software_brightness < 0.05f) software_brightness = 0.05f;
+            ESP_LOGI(TAG_MQTT, "Brightness: %d%% (%.2f)", percent, software_brightness);
+            /* Turn on if currently off */
+            if (current_animation == ANIM_OFF) {
+                current_animation = ANIM_SOLID;
+            }
+        }
+    }
+    /* ========================================================================
+       EFFECT COMMAND (for Google Home integration - maps to existing animations)
+       ======================================================================== */
+    else if (strncmp(command, "effect:", 7) == 0) {
+        const char *effect = command + 7;
+        ESP_LOGI(TAG_MQTT, "Effect: %s", effect);
+        
+        if (strcmp(effect, "solid") == 0 || strcmp(effect, "static") == 0 || strcmp(effect, "normal") == 0) {
+            current_animation = ANIM_SOLID;
+        } else if (strcmp(effect, "rainbow") == 0) {
+            current_animation = ANIM_RAINBOW;
+        } else if (strcmp(effect, "breathing") == 0 || strcmp(effect, "breathe") == 0 || strcmp(effect, "pulse") == 0) {
+            current_animation = ANIM_BREATHING;
+        } else if (strcmp(effect, "meteor") == 0 || strcmp(effect, "comet") == 0) {
+            current_animation = ANIM_METEOR;
+        } else if (strcmp(effect, "wave") == 0 || strcmp(effect, "ocean") == 0) {
+            current_animation = ANIM_WAVE;
+        } else if (strcmp(effect, "fusion") == 0 || strcmp(effect, "blend") == 0) {
+            current_animation = ANIM_FUSION;
+        } else if (strcmp(effect, "fire") == 0 || strcmp(effect, "flame") == 0 || strcmp(effect, "flames") == 0) {
+            current_animation = ANIM_FIRE;
+        } else if (strcmp(effect, "candle") == 0 || strcmp(effect, "candlelight") == 0 || strcmp(effect, "flicker") == 0) {
+            current_animation = ANIM_CANDLE;
+        } else if (strcmp(effect, "chill") == 0 || strcmp(effect, "relaxing") == 0 || strcmp(effect, "calm") == 0) {
+            current_animation = ANIM_CHILL;
+        } else if (strcmp(effect, "stars") == 0 || strcmp(effect, "twinkle") == 0) {
+            current_animation = ANIM_STARS;
+        } else if (strcmp(effect, "shower") == 0) {
+            current_animation = ANIM_METEOR_SHOWER;
+        } else if (strcmp(effect, "tetris") == 0) {
+            current_animation = ANIM_TETRIS;
+        } else {
+            ESP_LOGW(TAG_MQTT, "Unknown effect: %s", effect);
+        }
+    }
+    /* ========================================================================
        ZIGBEE BLIND CONTROL COMMANDS
        ======================================================================== */
     else if (strcmp(command, "blinds:pair") == 0) {
@@ -1689,7 +1758,7 @@ static void draw_brightness_gauge(void)
 {
     if (rgbw_strip == NULL) return;
     
-    float brightness_pct = pot_brightness;  /* 0.05 to 1.0 */
+    float brightness_pct = get_effective_brightness();  /* 0.05 to 1.0 */
     
     /* Normalize to 0-1 range for gauge calculation */
     float normalized = (brightness_pct - 0.05f) / 0.95f;
@@ -1752,13 +1821,14 @@ static void draw_brightness_gauge(void)
 /* Gamma correction for perceptually smooth brightness falloff */
 #define GAMMA 2.2f
 
-/* Master brightness is directly controlled by potentiometer
+/* Master brightness is controlled by potentiometer OR software override
    - Pot at min (0V): 5% brightness
    - Pot at max (3.3V): 100% brightness
-   pot_brightness ranges from 0.05 to 1.0 */
+   - Software override (via MQTT brightness:XX) takes precedence
+   Returns 0.05 to 1.0 */
 static float get_master_brightness(void)
 {
-    return pot_brightness;  /* Direct control, no cap */
+    return get_effective_brightness();  /* Uses software override if set */
 }
 
 /* Macro for all animations to use */

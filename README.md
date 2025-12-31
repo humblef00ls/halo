@@ -245,7 +245,24 @@ Built with ESP-IDF v5.5 (not Arduino). Uses:
 
 ## Voice Commands
 
-Say these through Google Home (via IFTTT → Adafruit IO → MQTT):
+### Via Google Home (Native Smart Home Integration)
+
+With native Google Home integration, you get natural voice control:
+
+```
+"Hey Google, turn on the Halo"
+"Hey Google, set Halo to 50%"
+"Hey Google, make Halo blue"
+"Hey Google, set Halo to rainbow mode"
+"Hey Google, open the blinds"
+"Hey Google, close the blinds to 30%"
+```
+
+See `google-home/SETUP.md` for setup instructions.
+
+### Via MQTT Commands
+
+Direct MQTT commands to the `commands` feed:
 
 | Command                                           | What it does                        |
 | ------------------------------------------------- | ----------------------------------- |
@@ -253,6 +270,9 @@ Say these through Google Home (via IFTTT → Adafruit IO → MQTT):
 | `fusion` / `wave` / `meteor` / `stars` / `tetris` | Pick an animation                   |
 | `rainbow` / `breathing` / `solid`                 | Classic modes                       |
 | `off` / `on`                                      | Power control                       |
+| `brightness:50` (0-100)                           | Set brightness percentage           |
+| `color:FF0000` (hex RGB/RGBW)                     | Set color by hex code               |
+| `effect:rainbow` / `effect:fire` / etc.           | Set animation by name               |
 | `slow` / `medium` / `fast`                        | Animation speed                     |
 | `red` / `blue` / `purple` / `white` / `warm`      | Named colors                        |
 | `blinds:open` / `blinds:close` / `blinds:stop`    | Zigbee blind control                |
@@ -465,10 +485,15 @@ If WiFi becomes flaky when Zigbee is active (or vice versa), this is expected be
 
 ### 🔄 Phase 3: Native Google Home (In Progress)
 
-- [ ] Google Smart Home API integration
+- [x] Google Smart Home API fulfillment (Cloud Function)
+- [x] OAuth2 account linking handler
+- [x] ESP32 MQTT commands for brightness/color/effects
+- [ ] Deploy to Google Cloud
 - [ ] Register LED ring as native light device
 - [ ] Register blinds as native blinds device
 - [ ] Natural voice: "Hey Google, make it purple"
+
+See `google-home/SETUP.md` for deployment instructions.
 
 ### 📋 Phase 4: Display & Sensors
 

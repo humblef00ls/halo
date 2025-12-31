@@ -1022,10 +1022,23 @@ static esp_err_t tuya_blind_control(const zigbee_device_t *blind, uint8_t contro
 /* Send Tuya blind position command (0-100%) */
 static esp_err_t tuya_blind_position(const zigbee_device_t *blind, uint8_t percent)
 {
-    ESP_LOGI(TAG, "Sending Tuya position %d%% to blind 0x%04x", percent, blind->short_addr);
+    /* MoES/Tuya blinds use INVERTED position convention:
+     *   Tuya 0%   = fully OPEN  (blinds up)
+     *   Tuya 100% = fully CLOSED (blinds down)
+     * Our convention (more intuitive):
+     *   0%   = fully CLOSED
+     *   100% = fully OPEN
+     * So we invert: tuya_percent = 100 - percent
+     */
+    uint8_t tuya_percent = 100 - percent;
+    
+    ESP_LOGI(TAG, "┌─── TUYA POSITION COMMAND ───");
+    ESP_LOGI(TAG, "│ Blind: 0x%04x, Endpoint: %d", blind->short_addr, blind->endpoint);
+    ESP_LOGI(TAG, "│ Requested: %d%% → Tuya value: %d%%", percent, tuya_percent);
+    ESP_LOGI(TAG, "└──────────────────────────────");
     
     /* Tuya uses 4-byte big-endian integer for VALUE type */
-    uint8_t data[4] = {0, 0, 0, percent};
+    uint8_t data[4] = {0, 0, 0, tuya_percent};
     return tuya_send_command(blind, TUYA_DP_PERCENT, TUYA_TYPE_VALUE, data, 4);
 }
 
@@ -1152,7 +1165,7 @@ esp_err_t zigbee_blind_set_position(uint16_t device_addr, uint8_t percent)
     
     /* Use Tuya protocol for Tuya devices */
     if (blind->device_type == ZIGBEE_DEVICE_TYPE_TUYA_BLIND) {
-        /* Tuya blinds: 0% = closed, 100% = open (same as our convention) */
+        /* tuya_blind_position handles the inversion internally */
         return tuya_blind_position(blind, percent);
     }
     

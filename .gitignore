@@ -22,3 +22,7 @@ dependencies.lock
 # Credentials (NEVER commit this!)
 main/credentials.h
 
+# Google Home Cloud Function
+google-home/.env
+google-home/node_modules/
+
