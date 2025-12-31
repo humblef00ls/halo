@@ -1,0 +1,21 @@
+{
+  "name": "halo-gate",
+  "version": "1.0.0",
+  "description": "Halo Gate - Google Smart Home fulfillment for Halo ESP32-C6 Hub",
+  "main": "index.js",
+  "scripts": {
+    "start": "functions-framework --target=smarthome",
+    "deploy": "gcloud functions deploy halo-gate --gen2 --runtime nodejs22 --trigger-http --allow-unauthenticated --entry-point=smarthome --region=us-central1"
+  },
+  "dependencies": {
+    "actions-on-google": "^3.0.0",
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.0",
+    "mqtt": "^5.3.0",
+    "@google-cloud/functions-framework": "^3.3.0"
+  },
+  "engines": {
+    "node": "22"
+  }
+}
+
